@@ -14,14 +14,16 @@ mod android {
     const CONTROL: &str = "/dev/loop-control";
 
     const GET_FREE: u32 = 0x4C82;
-    const CONFIGURE: u32 = 0x4C0A;
+    const SET_FD: u32 = 0x4C00;
+    const SET_STATUS64: u32 = 0x4C04;
 
     /// The device only ever reads. It stays pointed at the file until the
     /// recovery ends, which is as long as anything mounted from it lasts.
     const READ_ONLY: u32 = 1;
 
-    /// Every field is a plain number or a run of bytes, so the request is
-    /// made by zeroing it and filling in what matters.
+    /// What `LOOP_SET_STATUS64` takes, as the kernel's `loop_info64` is laid
+    /// out: every field a plain number or a run of bytes, filled by zeroing
+    /// it and writing what matters.
     #[repr(C)]
     struct Info {
         device: u64,
@@ -39,17 +41,14 @@ mod android {
         init: [u64; 2],
     }
 
-    #[repr(C)]
-    struct Config {
-        fd: u32,
-        block_size: u32,
-        info: Info,
-        reserved: [u64; 8],
-    }
-
     /// Open `file` from `offset` for `length` bytes as a block device, and
     /// give its path. The device goes away once whatever is mounted from it
     /// is unmounted.
+    ///
+    /// The newer `LOOP_CONFIGURE` combines the two calls below into one and
+    /// is atomic, but kernels before 5.8 do not have it: the older pair
+    /// `LOOP_SET_FD` then `LOOP_SET_STATUS64` is what those answer, and is
+    /// what every phone this recovery runs on before Android 11 keeps.
     pub fn attach(file: &Path, offset: u64, length: u64) -> Result<PathBuf> {
         let backing = File::open(file).with_context(|| format!("open {}", file.display()))?;
         let control = File::open(CONTROL).with_context(|| format!("open {CONTROL}"))?;
@@ -63,13 +62,19 @@ mod android {
             .write(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        let mut config: Config = unsafe { std::mem::zeroed() };
-        config.fd = backing.as_raw_fd() as u32;
-        config.info.offset = offset;
-        config.info.size_limit = length;
-        config.info.flags = READ_ONLY;
-        if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
+        // Point the device at the file: the older call takes the file's
+        // descriptor as its argument.
+        if unsafe { libc::ioctl(device.as_raw_fd(), SET_FD as libc::Ioctl, backing.as_raw_fd()) } < 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
+        }
+        // Tell it where in the file the part it serves begins, and how long
+        // that part is, and that it is read-only.
+        let mut info: Info = unsafe { std::mem::zeroed() };
+        info.offset = offset;
+        info.size_limit = length;
+        info.flags = READ_ONLY;
+        if unsafe { libc::ioctl(device.as_raw_fd(), SET_STATUS64 as libc::Ioctl, &info) } < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("set {} to offset {offset} length {length}", path.display()));
         }
         Ok(path)
     }

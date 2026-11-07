@@ -136,7 +136,7 @@ impl Binder {
     /// is already mounted, or the kernel has no such filesystem at all,
     /// say so rather than fail: what asked for the driver says what it
     /// wanted it for.
-    fn binderfs() -> Result<()> {
+    pub fn binderfs() -> Result<()> {
         use std::ffi::CString;
         let at = std::path::Path::new(BINDERFS);
         std::fs::create_dir_all(at).with_context(|| format!("make {BINDERFS}"))?;

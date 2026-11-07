@@ -496,6 +496,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     skyward_block::fstab::set_files(&cfg.block.fstab_files);
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
+    // The binder driver's nodes are where the phone's own init mounts its
+    // filesystem, and a recovery started without that init has none: mount
+    // it before anything below opens a driver node, as the hardware services
+    // a phone's secure world is reached through do.
+    if !Path::new("/dev/binder").exists() {
+        skyward_binder::driver::Binder::binderfs()?;
+    }
     let props = skyward_info::installed_props(slot)?;
     adopt_installed_version(&props)?;
     // Without logd the phone's own programs still run, and only what they

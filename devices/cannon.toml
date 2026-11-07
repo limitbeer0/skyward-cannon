@@ -90,6 +90,32 @@ fstab_files = ["/vendor/etc/fstab.mt6853", "/vendor/etc/fstab.emmc"]
 # needs is not measured, and naming one on a guess mounts a partition whose
 # files nothing here opens; it comes with the [[service]] section below.
 
+# The trusted environment's device nodes, owned as its own init's `on fs`
+# does (measured from /vendor/etc/init/microtrust.rc, 2026-11-07): the key
+# service opens /dev/ut_keymaster as system:drmrpc, the daemon opens
+# /dev/teei_client and /dev/teei_config as system:system, and the RPMB
+# device the secure world keeps its rollback counter on is system:system.
+# A recovery's ueventd makes them root's alone, so the services abort
+# before they open one: the owners below give them what init would.
+[[owners]]
+user = "system"
+group = "drmrpc"
+mode = 0o660
+paths = ["/dev/ut_keymaster"]
+
+[[owners]]
+user = "system"
+group = "system"
+mode = 0o660
+paths = ["/dev/teei_client", "/dev/teei_config", "/dev/tz_vfs", "/dev/teei_fp", "/dev/rpmb0"]
+
+[[owners]]
+# /dev/isee_tee0 is 0666 for SVP in the phone's own rc.
+user = "system"
+group = "drmrpc"
+mode = 0o666
+paths = ["/dev/isee_tee0"]
+
 # TODO: this WLAN is a guess, never brought up in a recovery on this phone.
 # It is not Qualcomm's cnss — there is no /sys/kernel/cnss/fs_ready — but
 # MediaTek's WMT over a MT6631/MT6635, whose modules the vendor partition
@@ -211,6 +237,7 @@ logs = [
 # linker finds its libraries; it opens the driver's filesystem itself where
 # the recovery has not.
 path = "/system_root/system/bin/hwservicemanager"
+libraries = ["/system_root/system/lib64", "/vendor/lib64"]
 user = "system"
 groups = ["system", "readproc"]
 ready_property = "hwservicemanager.ready"
@@ -253,6 +280,7 @@ groups = ["system"]
 # whose directory has no key service registered answers nothing.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.keymaster@4.1-service.beanpod"
+libraries = ["/vendor/lib64", "/system_root/system/lib64"]
 user = "system"
 groups = ["system", "drmrpc"]
 ready_hardware_service = "android.hardware.keymaster@4.1::IKeymasterDevice/default"
@@ -260,6 +288,7 @@ registers = ["android.hardware.keymaster@4.0::IKeymasterDevice/default"]
 
 [[service]]
 path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
+libraries = ["/vendor/lib64", "/system_root/system/lib64"]
 user = "system"
 groups = ["system"]
 ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
