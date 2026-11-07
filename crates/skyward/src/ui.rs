@@ -10,6 +10,7 @@ use crate::pty;
 use crate::readings::{Reading, Readings};
 use crate::secure;
 use crate::services;
+use crate::settings;
 use crate::updates;
 use crate::wipe::{self, Eraser, Step};
 use crate::wlan;
@@ -34,6 +35,7 @@ use skyward_ui::app::{
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
     RenameRefused, Screen, Shot, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS, INSTALL_UNFINISHED, USB_DRIVE,
 };
+use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
@@ -57,16 +59,16 @@ const LEAVE_AFTER_MS: u64 = 1500;
 /// none by then, the pages are worked with the keys, their light shown.
 const TOUCH_WAIT: Duration = Duration::from_secs(5);
 
-/// Where logs saved to the temporary folder go, and where in internal
-/// storage the others do.
-const TMP_LOGS: &str = "/tmp/skyward-logs";
+/// Where logs saved to the temporary folder go, in the recovery service's
+/// own folder, and where in internal storage the others do.
+const TMP_LOGS: &str = "/skyward/run/logs";
 const STORAGE_LOGS: &str = "Skyward/logs";
 
 /// The folder of internal storage the system saves its own screenshots in,
-/// which the gallery shows as its screenshots, and where a screenshot waits
-/// for internal storage to open.
+/// which the gallery shows as its screenshots, and where in the recovery
+/// service's own folder a screenshot waits for internal storage to open.
 const SCREENSHOTS: &str = "DCIM/Screenshots";
-const HELD_SCREENSHOTS: &str = "/tmp/screenshots";
+const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
 
 /// The panel backlight, at the node [`crate::backlight`] finds for this
 /// phone's kernel.
@@ -999,12 +1001,22 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     };
     let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
-    // The pages speak the language the system named with the work it asks
-    // for, or else the one the installed system is built to start in.
-    if let Some(locale) = request.locale.as_deref().or(info.locale.as_deref()) {
-        app.state.lang = Lang::for_locale(locale)?;
-        skyward_sys::kmsg(&format!("the pages speak {:?}, for the locale {locale}", app.state.lang))?;
-    }
+    // The settings kept from the starts before are back before the first
+    // frame, and before file transfer starts with its switch and the time
+    // zone. The pages speak the language chosen then, or else the one the
+    // system named with the work it asks for, or the one the installed
+    // system is built to start in, or else the one they last spoke.
+    let kept = settings::read()?;
+    let locale = request.locale.as_deref().or(info.locale.as_deref());
+    let named = locale.map(Lang::for_locale).transpose()?;
+    app.take_settings(kept.settings(), named);
+    let mut keeper = Keeper::new(&kept);
+    skyward_sys::kmsg(&format!(
+        "the pages speak {:?}, {}, and the locale named is {}",
+        app.state.lang,
+        if app.state.language_chosen { "the language chosen" } else { "with none chosen" },
+        locale.unwrap_or("none")
+    ))?;
     // The home page tells of a restart into the slot the system does not
     // run from now: an update or a switch left for the next boot.
     if info.slot.is_some() {
@@ -1476,8 +1488,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 }
             }
         }
+        // Erasing all data makes /metadata afresh, and the settings with it
+        // are written there again.
         if erased {
             eraser = None;
+            keeper.remade();
         }
         let job_end = |end: filework::End| match end {
             filework::End::Done => JobEnd::Done,
@@ -1550,8 +1565,11 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 }
             }
         }
+        // Work on whole partitions may have erased or made afresh the one
+        // the settings are kept on.
         if parted {
             part_worker = None;
+            keeper.remade();
         }
         // The folder shown is read again for what the work changed.
         if worked {
@@ -1618,6 +1636,26 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         if app.screen() == Screen::Wlan && wlan_on && scanned_at.elapsed() >= SCAN_EVERY {
             scanned_at = Instant::now();
             wlan_worker(&wlan)?.send(wlan::Command::Scan);
+        }
+        // Settings changed go into their file a moment after the last
+        // change, while nothing else has /metadata: not in fastboot, whose
+        // fastbootd may, nor while an install, a merge, erasing, a backup or
+        // work on whole partitions is under way.
+        let metadata_busy =
+            fastboot || installer.is_some() || merger.is_some() || eraser.is_some() || backuper.is_some() || part_worker.is_some();
+        if !metadata_busy {
+            if let Some(due) = keeper.due(app.settings(), now) {
+                match settings::write(&due) {
+                    Ok(()) => {
+                        skyward_sys::kmsg("the settings are kept")?;
+                        keeper.written(due);
+                    }
+                    Err(e) => {
+                        skyward_sys::kmsg(&format!("the settings were not kept: {e:#}"))?;
+                        keeper.failed();
+                    }
+                }
+            }
         }
         let mut checked = false;
         if let Some(c) = &checker {

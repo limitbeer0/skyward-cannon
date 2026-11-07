@@ -17,6 +17,12 @@ pub mod ramdisk {
     pub const MONO_LICENSE: &str = "skyward/KirkMono-OFL.txt";
     /// The recovery service binary init starts.
     pub const RECOVERY: &str = "system/bin/recovery";
+    /// The commands install scripts written for other recoveries run that
+    /// Skyward answers itself: 7za and zstd, which a stock recovery does not
+    /// carry, and unzip, whose stock version holds all that `-p` takes out in
+    /// memory. Each is a link to the recovery service binary beside it, which
+    /// runs the command it is started as.
+    pub const COMMANDS: [&str; 3] = ["system/bin/7za", "system/bin/unzip", "system/bin/zstd"];
     /// The first property file init loads in recovery mode.
     pub const PROP_DEFAULT: &str = "prop.default";
     /// The scheduling profiles libprocessgroup reads.
@@ -733,6 +739,14 @@ mod tests {
         for bad in ["/data/../system", "/data/./log", "/data//log", "/data/log/"] {
             let text = format!("[device]\ncodename = \"x\"\n[wipe]\nlogs = [\"{bad}\"]\n");
             assert!(DeviceConfig::parse(&text).is_err(), "{bad} is refused");
+        }
+    }
+
+    #[test]
+    fn the_commands_sit_beside_the_recovery_service_binary() {
+        let folder = |path: &str| Path::new(path).parent().map(Path::to_path_buf);
+        for command in ramdisk::COMMANDS {
+            assert_eq!(folder(command), folder(ramdisk::RECOVERY), "{command}");
         }
     }
 

@@ -32,6 +32,8 @@ mod secure;
 #[cfg(target_os = "android")]
 mod services;
 #[cfg(target_os = "android")]
+mod settings;
+#[cfg(target_os = "android")]
 mod ui;
 #[cfg(target_os = "android")]
 mod updates;
@@ -208,9 +210,15 @@ enum Cmd {
 
 fn main() -> Result<()> {
     // init starts the recovery service by path with no arguments.
-    let started_as = std::env::args().next().unwrap_or_default();
-    if Path::new(&started_as).file_name().is_some_and(|n| n == "recovery") {
+    let started_as = std::env::args_os().next().unwrap_or_default();
+    let name = Path::new(&started_as).file_name().unwrap_or_default();
+    if name == "recovery" {
         return recovery();
+    }
+    // Install scripts run the commands linked to this binary by their names.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(code) = skyward_install::commands::run(name, &args) {
+        std::process::exit(code);
     }
     match Cli::parse().cmd {
         Cmd::Info { config } => info(&config),
@@ -672,15 +680,22 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
     Ok(())
 }
 
-/// The recovery service. Its log is kept from the start, and adb comes up
-/// first so a failure later on can be inspected, file transfer joining it
+/// The recovery service. Its own folder is made and its log kept there from
+/// the start, and adb comes up first so a failure later on can be
+/// inspected, file transfer joining it
 /// once the screen starts; then the boot request in misc is read. A
 /// request whose work
 /// goes on stays in misc until the work is done; any other is cleared at
 /// once, so that any reboot from here boots the system. Failures go to the
 /// kernel log and still end the process, which init then starts again.
 fn recovery() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let run = || -> Result<()> {
+        // Open to the programs the recovery runs as other users, the
+        // supplicant among them, whatever the umask.
+        std::fs::create_dir_all(skyward_sys::RUN).with_context(|| format!("make {}", skyward_sys::RUN))?;
+        std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.

@@ -20,6 +20,11 @@ pub struct Entry {
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+
+/// The permissions a stock ramdisk gives its links, such as the commands
+/// in system/bin that stand for toybox.
+const LINK_MODE: u32 = 0o755;
 
 impl Entry {
     pub fn is_dir(&self) -> bool {
@@ -211,6 +216,24 @@ impl Ramdisk {
 
     /// Add a root-owned regular file, creating missing parent directories.
     pub fn add(&mut self, name: &str, mode: u32, data: Vec<u8>) -> Result<()> {
+        self.insert(name, S_IFREG | mode, data)
+    }
+
+    /// Point `name` to `target`: a link already there is pointed anew, and
+    /// otherwise a root-owned link is added, creating missing parent
+    /// directories.
+    pub fn link(&mut self, name: &str, target: &str) -> Result<()> {
+        match self.entries.iter_mut().find(|e| e.name == name) {
+            Some(e) if e.mode & S_IFMT == S_IFLNK => {
+                e.data = target.as_bytes().to_vec();
+                Ok(())
+            }
+            Some(_) => bail!("{name} is in the ramdisk and is not a link"),
+            None => self.insert(name, S_IFLNK | LINK_MODE, target.as_bytes().to_vec()),
+        }
+    }
+
+    fn insert(&mut self, name: &str, mode: u32, data: Vec<u8>) -> Result<()> {
         if self.find(name).is_some() {
             bail!("{name} is already in the ramdisk");
         }
@@ -227,7 +250,7 @@ impl Ramdisk {
                 None => self.entries.push(root_entry(&parent, S_IFDIR | 0o755, Vec::new())),
             }
         }
-        self.entries.push(root_entry(name, S_IFREG | mode, data));
+        self.entries.push(root_entry(name, mode, data));
         Ok(())
     }
 }
@@ -377,5 +400,44 @@ mod tests {
         let from_legacy = Ramdisk::decode(&archive).unwrap();
         assert_eq!(from_frame.entries.len(), from_legacy.entries.len());
         assert_eq!(from_frame.entries[2].data, from_legacy.entries[2].data);
+    }
+
+    #[test]
+    fn a_link_is_kept_as_a_link_to_its_target() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
+        rd.link("system/bin/zstd", "recovery").unwrap();
+        rd.link("sbin/sh", "/system/bin/sh").unwrap();
+        let back = Ramdisk::decode(&rd.encode().unwrap()).unwrap();
+        let zstd = back.find("system/bin/zstd").unwrap();
+        assert_eq!((zstd.mode, zstd.data.as_slice()), (S_IFLNK | LINK_MODE, b"recovery".as_slice()));
+        assert_eq!((zstd.uid, zstd.gid, zstd.nlink), (0, 0, 1));
+        assert!(back.find("sbin").is_some_and(Entry::is_dir), "a missing folder is made");
+        assert!(rd.link("system/bin/recovery", "zstd").is_err(), "a file is no link to point anew");
+        assert!(rd.link("system/bin/recovery/7za", "recovery").is_err(), "a file holds no links");
+    }
+
+    #[test]
+    fn a_link_already_there_is_pointed_anew_keeping_the_rest_of_its_entry() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/ziptool", 0o755, b"binary".to_vec()).unwrap();
+        rd.entries.push(Entry {
+            name: "system/bin/unzip".into(),
+            mode: S_IFLNK | 0o755,
+            uid: 0,
+            gid: 2000,
+            mtime: 0,
+            nlink: 1,
+            dev: (0, 0),
+            rdev: (0, 0),
+            data: b"ziptool".to_vec(),
+        });
+        let count = rd.entries.len();
+        rd.link("system/bin/unzip", "recovery").unwrap();
+        let back = Ramdisk::decode(&rd.encode().unwrap()).unwrap();
+        let unzip = back.find("system/bin/unzip").unwrap();
+        assert_eq!((unzip.data.as_slice(), unzip.mode, unzip.gid), (b"recovery".as_slice(), S_IFLNK | 0o755, 2000));
+        assert_eq!(back.entries.len(), count, "no second entry of the name");
+        assert!(back.find("system/bin/ziptool").is_some(), "what it pointed to stays");
     }
 }
