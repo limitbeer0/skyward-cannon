@@ -342,8 +342,17 @@ pub fn settings(cx: &Ctx) -> Frame {
     ]);
     y = widgets::footnote(&mut c, t, f, usb.bottom, note);
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
-    let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
-    out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
+    let debug = widgets::list(
+        &mut c,
+        t,
+        f,
+        y,
+        &[
+            Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
+            Row::new(l.pick(["截屏", "截圖", "Screenshot"])),
+        ],
+    );
+    out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal), Action::Screenshot]));
     y = widgets::section(&mut c, t, f, debug.bottom, l.pick(["关于", "關於", "About"]));
     let about = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(ABOUT)).trail(Trail::Value(VERSION))]);
     out.extend(hits(&about.rows, &[Action::Open(Screen::About)]));
@@ -426,7 +435,7 @@ pub fn mount(cx: &Ctx) -> Frame {
                 Some(failure) => widgets::footnote(&mut c, t, f, list.bottom, &fmt::mount_failure(l, failure)),
                 None => list.bottom,
             };
-            let about = match cx.info.slot.map(|s| s.letter()) {
+            let about = match cx.info.slot.filter(|s| *s != Slot::Only).map(|s| s.letter()) {
                 Some(slot) => tr!(
                     l,
                     "仅显示当前槽位 {slot} 在 super 中的分区，挂载后均为只读。",
@@ -445,7 +454,7 @@ pub fn mount(cx: &Ctx) -> Frame {
 }
 
 /// Who made the recovery, as the About page names them under its version.
-const AUTHOR: &str = "© 2026 Kirk Lin";
+const AUTHOR: &str = "© 2026 Kirk Lin · fuzhi";
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -567,7 +576,10 @@ pub fn specs(cx: &Ctx) -> Frame {
 
     let mut boot = Vec::new();
     if let Some(s) = i.slot {
-        boot.push((l.pick(CURRENT_SLOT), s.letter().to_string()));
+        // One copy of every partition has no slot to name.
+        if s != Slot::Only {
+            boot.push((l.pick(CURRENT_SLOT), s.letter().to_string()));
+        }
         boot.push((l.pick(UPDATE), fmt::snapshot(l, &i.snapshot).to_string()));
     }
     if let Some(unlocked) = i.boot.unlocked {
@@ -771,10 +783,18 @@ pub fn reboot(cx: &Ctx) -> Frame {
             Some(Err(_)) => l.pick(UNREADABLE).to_string(),
             None => String::new(),
         };
-        y = widgets::section(&mut c, t, f, y, l.pick(["槽位", "槽位", "Slot"]));
-        let slots = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["下次启动", "下次啟動", "Next boot"])).trail(Trail::Value(&next))]);
-        out.extend(hits(&slots.rows, &[Action::Open(Screen::Slot)]));
-        y = slots.bottom;
+        if !matches!(cx.info.slot, Some(Slot::Only)) {
+            y = widgets::section(&mut c, t, f, y, l.pick(["槽位", "槽位", "Slot"]));
+            let slots = widgets::list(
+                &mut c,
+                t,
+                f,
+                y,
+                &[Row::new(l.pick(["下次启动", "下次啟動", "Next boot"])).trail(Trail::Value(&next))],
+            );
+            out.extend(hits(&slots.rows, &[Action::Open(Screen::Slot)]));
+            y = slots.bottom;
+        }
     }
     let (label, danger) = confirm_label(Confirm::Reboot, cx.state);
     let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
@@ -796,9 +816,11 @@ pub fn install(cx: &Ctx) -> Frame {
         facts.push((l.pick(SECURITY_PATCH), fmt::patch(l, p)));
     }
     if let Some(s) = i.slot {
-        let (slot, other) = (s.letter(), s.other().letter());
-        let detail = tr!(l, "{slot}，系统更新将安装到槽位 {other}", "{slot}，系統更新將安裝到槽位 {other}", "{slot}, and a system update installs to slot {other}");
-        facts.push((l.pick(CURRENT_SLOT), detail));
+        if s != Slot::Only {
+            let (slot, other) = (s.letter(), s.other().letter());
+            let detail = tr!(l, "{slot}，系统更新将安装到槽位 {other}", "{slot}，系統更新將安裝到槽位 {other}", "{slot}, and a system update installs to slot {other}");
+            facts.push((l.pick(CURRENT_SLOT), detail));
+        }
     }
     let ways = l.pick(["安装方式", "安裝方式", "Ways to install"]);
     let y = if facts.is_empty() {
@@ -839,11 +861,19 @@ pub fn install(cx: &Ctx) -> Frame {
     let methods = widgets::list(&mut c, t, f, y, &rows);
     let from_usb = Action::Open(Screen::Choose(Place::UsbDrive));
     let mut out = hits(&methods.rows[methods.rows.len() - 3..], &[from_storage, from_usb, Action::Sideload]);
-    let what = l.pick([
+    let what = if cx.info.slot == Some(Slot::Only) {
+        l.pick([
+            "支持安装带安装脚本的刷机包，以及刷入 boot、recovery、dtbo、vbmeta 等分区镜像。选择文件时仅列出文件夹以及 .zip、.img 文件。",
+            "支援安裝帶有安裝指令碼的刷機包，以及刷入 boot、recovery、dtbo、vbmeta 等分割區映像檔。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
+            "Installs flashable zips with an install script, and flashes boot, recovery, dtbo and vbmeta partition images. Choosing a file lists only folders and .zip and .img files.",
+        ])
+    } else {
+        l.pick([
         "支持安装 A/B 完整更新包和带安装脚本的刷机包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分区镜像。系统更新将安装到另一个槽位，重启后从该槽位启动。选择文件时仅列出文件夹以及 .zip、.img 文件。",
         "支援安裝 A/B 完整更新檔和帶有安裝指令碼的刷機包，以及刷入 boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 分割區映像檔。系統更新將安裝到另一個槽位，重新啟動後從該槽位啟動。選擇檔案時僅列出資料夾以及 .zip、.img 檔案。",
         "Installs A/B full OTA packages and flashable zips with an install script, and flashes boot, init_boot, vendor_boot, recovery, dtbo and vbmeta partition images. A system update installs to the other slot, which starts after a reboot. Choosing a file lists only folders and .zip and .img files.",
-    ]);
+        ])
+    };
     let y = widgets::footnote(&mut c, t, f, methods.bottom, what);
     let y = widgets::section(&mut c, t, f, y, l.pick(["选项", "選項", "Options"]));
     let check = Row::new(l.pick(["验证刷机包签名", "驗證刷機包簽章", "Verify zip signatures"])).trail(Trail::Switch(cx.state.check_signature));
@@ -1120,14 +1150,26 @@ pub fn installing(cx: &Ctx) -> Frame {
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            // One copy of every partition: there is no other slot to put an
+            // image in, so the choice is not offered.
+            let (y, picks) = match i.slot {
+                Some(Slot::Only) => (parts.bottom, None),
+                _ => {
+                    let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
+                    let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                    let rows: Vec<Row> = Pick::ALL
+                        .iter()
+                        .zip(&titles)
+                        .map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick)))
+                        .collect();
+                    let picks = widgets::list(&mut c, t, f, y, &rows);
+                    out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                    (picks.bottom, Some(()))
+                }
+            };
+            let _ = &picks;
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
             let note = l.pick(match s.source {
                 Source::Computer => [
@@ -1670,7 +1712,10 @@ pub fn backup(cx: &Ctx) -> Frame {
             "Apps, accounts and settings, without internal storage, the screen lock or fingerprints. Decrypt first",
         ],
     });
-    let boot = l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]);
+    let boot = match cx.info.slot {
+        Some(Slot::Only) => l.pick(["boot、dtbo、vbmeta 和 recovery", "boot、dtbo、vbmeta 和 recovery", "boot, dtbo, vbmeta and recovery"]),
+        _ => l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]),
+    };
     let modem = l.pick(["IMEI、基带设置和传感器校准数据", "IMEI、基頻設定和感應器校正資料", "IMEI, modem settings and sensor calibration"]);
     let subs = [boot, system, data, modem];
     let rows: Vec<Row> = BACKUP_PARTS
@@ -2051,22 +2096,29 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let (t, f, l) = (cx.t, cx.f, cx.state.lang);
     let mut c = page(cx);
     let top = t.m.content_top;
-    let tools = widgets::list(&mut c, t, f, top, &[
+    let mut rows = vec![
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
-        Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))),
-    ]);
-    let out = hits(&tools.rows, &[
+    ];
+    let mut actions = vec![
         Action::Open(Screen::Files),
         Action::Open(Screen::Terminal),
         Action::Open(Screen::Relabel),
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
-        Action::Open(Screen::Update),
-    ]);
+    ];
+    // A system update installs to the other slot, which a phone with one copy
+    // of every partition has none of.
+    if cx.info.slot != Some(Slot::Only) {
+        rows.push(Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))));
+        actions.push(Action::Open(Screen::Update));
+    }
+
+    let tools = widgets::list(&mut c, t, f, top, &rows);
+    let out = hits(&tools.rows, &actions);
     Frame::new(t, c, out, l.pick(ADVANCED), top)
 }
 
@@ -3358,14 +3410,14 @@ pub fn fastboot(cx: &Ctx) -> Frame {
         UsbLink::Connecting => ["正在连接", "正在連線", "Connecting"],
         UsbLink::Unplugged => ["未连接电脑", "未連接電腦", "No computer"],
     });
-    let slot = i.slot.map(|s| s.letter());
+    let slot = i.slot.filter(|s| *s != Slot::Only);
     let mut facts = vec![
         Row::new("fastbootd").trail(Trail::Text(running)),
         Row::new("USB").trail(Trail::Text(link)),
         Row::new(l.pick(["设备代号", "裝置代號", "Codename"])).trail(Trail::Text(&i.codename)),
     ];
-    if let Some(letter) = slot {
-        facts.push(Row::new(l.pick(CURRENT_SLOT)).trail(Trail::Text(letter)));
+    if let Some(slot) = slot {
+        facts.push(Row::new(l.pick(CURRENT_SLOT)).trail(Trail::Text(slot.letter())));
     }
     let y = widgets::section_first(&mut c, t, f, top, l.pick(["状态", "狀態", "Status"]));
     let state = widgets::list(&mut c, t, f, y, &facts);

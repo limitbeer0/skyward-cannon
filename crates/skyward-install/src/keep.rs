@@ -35,9 +35,15 @@ impl Kept {
     /// slot does not hold Skyward, as when it was started without being
     /// flashed.
     pub fn hold(dir: &Path, current: Slot) -> Result<Option<Kept>> {
+        // An A-only phone has one recovery partition, the one this is running
+        // from, and no second copy to keep it in.
+        if current == Slot::Only {
+            return Ok(None);
+        }
         let (a, image_a) = read(&image::device(dir, PARTITION, Slot::A))?;
         let (b, image_b) = read(&image::device(dir, PARTITION, Slot::B))?;
         let (held, image) = match current {
+            Slot::Only => unreachable!("handled above"),
             Slot::A => (a, image_a),
             Slot::B => (b, image_b),
         };

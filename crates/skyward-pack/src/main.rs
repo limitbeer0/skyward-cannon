@@ -11,7 +11,7 @@ mod image;
 mod ramdisk;
 
 use image::BootImage;
-use ramdisk::Ramdisk;
+use ramdisk::{Compression, Ramdisk};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -29,7 +29,15 @@ enum Cmd {
     Cat { image: PathBuf, path: String },
     /// Unpack and pack an image's ramdisk unchanged, to check that a rebuilt
     /// archive keeps every entry.
-    Repack { image: PathBuf, out: PathBuf },
+    Repack {
+        image: PathBuf,
+        out: PathBuf,
+        /// Hold the ramdisk in this compression rather than the one the image
+        /// was read with, for a kernel that reads fewer formats than the image
+        /// it came from was written for.
+        #[arg(long, value_enum)]
+        ramdisk_compression: Option<Compression>,
+    },
     /// Join a kernel and another image's ramdisk into one boot image.
     Boot {
         /// Image holding the kernel (the device's boot partition).
@@ -40,6 +48,10 @@ enum Cmd {
         ramdisk: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Hold the ramdisk in this compression rather than the one the image
+        /// was read with.
+        #[arg(long, value_enum)]
+        ramdisk_compression: Option<Compression>,
     },
     /// Build a Skyward recovery image on top of the device's stock recovery:
     /// its init, adbd, SELinux policy and libraries stay, the recovery
@@ -65,6 +77,12 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// Hold the ramdisk in this compression rather than the one the stock
+        /// image carries, which is what a kernel configured for fewer formats
+        /// than the image it came from was written for needs: a MediaTek kernel
+        /// of this age reads gzip and no LZ4, and reads no LZ4 at all.
+        #[arg(long, value_enum)]
+        ramdisk_compression: Option<Compression>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -93,20 +111,32 @@ fn main() -> Result<()> {
             std::io::stdout().write_all(&e.data)?;
             Ok(())
         }
-        Cmd::Repack { image, out } => {
+        Cmd::Repack { image, out, ramdisk_compression } => {
             let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
+            img.ramdisk = encode(&img.ramdisk, ramdisk_compression)?;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Boot { kernel, ramdisk, out } => {
+        Cmd::Boot { kernel, ramdisk, out, ramdisk_compression } => {
             let mut img = BootImage::read(&ramdisk)?;
             img.kernel = BootImage::read(&kernel)?.kernel;
+            if ramdisk_compression.is_some() {
+                // Joining a kernel and another image's ramdisk left the archive's
+                // bytes alone before; they are gone through a compressor only
+                // when a caller asks for a format the source image was not in.
+                img.ramdisk = encode(&img.ramdisk, ramdisk_compression)?;
+            }
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, binary, config, font, mono, mono_license, ramdisk_compression, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
+            // A device's kernel reads its ramdisk only in the formats its own
+            // configuration built, so the archive goes back in the one the
+            // stock image was found to hold unless the caller says otherwise.
+            if let Some(compression) = ramdisk_compression {
+                rd.compression = compression;
+            }
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
             if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
@@ -155,6 +185,18 @@ fn main() -> Result<()> {
 
 /// The partition a recovery is made on, as a full update package names it.
 const RECOVERY: &str = "recovery";
+
+/// Read a ramdisk and write it back, in the compression found in it unless the
+/// caller names another; a device's kernel reads only the formats its own
+/// configuration built, which is a fact about the device and not about the
+/// image it came with.
+fn encode(ramdisk: &[u8], compression: Option<Compression>) -> Result<Vec<u8>> {
+    let rd = Ramdisk::decode(ramdisk)?;
+    match compression {
+        Some(compression) => rd.encode_as(compression),
+        None => rd.encode(),
+    }
+}
 
 /// Take the recovery partition out of the stock build's full update package
 /// on its server, reading only what that partition takes of it, and write it
@@ -247,14 +289,28 @@ fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
 
 fn list(image: &Path) -> Result<()> {
     let img = BootImage::read(image)?;
-    let h = &img.header;
+    let sizes = img
+        .named_sizes()
+        .into_iter()
+        .filter(|(_, size)| *size != 0)
+        .map(|(what, size)| format!("{what} {size} bytes"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    // An image whose header names no ramdisk holds none to name a format of;
+    // saying what its bytes are not would read as damage where there is none.
+    let format = match img.ramdisk.is_empty() {
+        true => "none".to_string(),
+        false => Ramdisk::decode(&img.ramdisk).map(|rd| rd.compression.label().to_string()).unwrap_or_else(|e| e.to_string()),
+    };
     println!(
-        "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
-        h.header_version(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        h.osversionpatch
+        "header v{}  page {}  {sizes}  ramdisk {format}  {:?}",
+        img.header_version(),
+        img.page_size(),
+        img.header.osversionpatch()
     );
+    if let Some(kind) = img.digest_kind() {
+        println!("digest {kind}");
+    }
     if img.ramdisk.is_empty() {
         return Ok(());
     }

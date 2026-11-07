@@ -12,6 +12,11 @@ const DEVICE: &str = "/dev/binder";
 /// and the node inside it.
 const HARDWARE: [&str; 2] = ["/dev/hwbinder", "/dev/binderfs/hwbinder"];
 
+/// The filesystem the driver lives in where the phone keeps it there rather
+/// than as a plain node: mounted as the phone's own init mounts it, which a
+/// recovery started without that init has not done.
+const BINDERFS: &str = "/dev/binderfs";
+
 /// The layout this crate speaks. The driver refuses a program that knows a
 /// different one.
 const PROTOCOL: i32 = 8;
@@ -95,6 +100,16 @@ pub struct Binder {
 
 impl Binder {
     pub fn open() -> Result<Binder> {
+        if !Path::new(DEVICE).exists() {
+            // A recovery started without the phone's own init has no driver
+            // node yet where newer phones keep it: the kernel makes these
+            // nodes only inside the driver's own filesystem, and init is
+            // what mounts that at /dev/binderfs as the phone starts. So
+            // mount it the way init does, and reach the driver at the node
+            // it made there.
+            Binder::binderfs()?;
+            return Binder::on(&Path::new(BINDERFS).join("binder"));
+        }
         Binder::on(Path::new(DEVICE))
     }
 
@@ -105,8 +120,39 @@ impl Binder {
             .iter()
             .map(Path::new)
             .find(|p| p.exists())
+            .or_else(|| {
+                // Neither node: the driver's filesystem is not mounted, so
+                // mount it and look again where the phone's own init would
+                // have put the node.
+                Binder::binderfs().ok()?;
+                HARDWARE.iter().map(Path::new).find(|p| p.exists())
+            })
             .with_context(|| format!("none of {} is here, so no hardware service can be reached", HARDWARE.join(" or ")))?;
         Binder::on(node)
+    }
+
+    /// Mount the binder driver's own filesystem where the phone keeps it,
+    /// as its init does before any program reaches a driver node. Where it
+    /// is already mounted, or the kernel has no such filesystem at all,
+    /// say so rather than fail: what asked for the driver says what it
+    /// wanted it for.
+    fn binderfs() -> Result<()> {
+        use std::ffi::CString;
+        let at = std::path::Path::new(BINDERFS);
+        std::fs::create_dir_all(at).with_context(|| format!("make {BINDERFS}"))?;
+        let (src, dst, ty) = (CString::new("binder").unwrap(), CString::new(BINDERFS).unwrap(), CString::new("binder").unwrap());
+        // Nothing asked of the driver besides its own nodes: the features
+        // newer init turns on answer to libbinder's own calls, and this
+        // program speaks the driver directly. The older kernels of these
+        // phones refuse a mount that names a feature they do not know.
+        if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // EBUSY means it is mounted already, which is what was wanted.
+            if err.raw_os_error() != Some(libc::EBUSY) {
+                return Err(err).context("mount the binder driver's filesystem");
+            }
+        }
+        Ok(())
     }
 
     fn on(node: &Path) -> Result<Binder> {

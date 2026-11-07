@@ -18,6 +18,9 @@ pub use snapshots::Merge;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
+    /// A phone with one copy of every partition and no slot suffix, as an
+    /// A-only device carries: nothing to switch to, nothing to keep beside.
+    Only,
     A,
     B,
 }
@@ -25,6 +28,7 @@ pub enum Slot {
 impl Slot {
     pub fn suffix(self) -> &'static str {
         match self {
+            Slot::Only => "",
             Slot::A => "_a",
             Slot::B => "_b",
         }
@@ -32,6 +36,7 @@ impl Slot {
 
     pub fn letter(self) -> &'static str {
         match self {
+            Slot::Only => "",
             Slot::A => "A",
             Slot::B => "B",
         }
@@ -40,13 +45,14 @@ impl Slot {
     /// The slot's metadata copy in super.
     pub fn number(self) -> u32 {
         match self {
-            Slot::A => 0,
+            Slot::Only | Slot::A => 0,
             Slot::B => 1,
         }
     }
 
     pub fn other(self) -> Slot {
         match self {
+            Slot::Only => Slot::Only,
             Slot::A => Slot::B,
             Slot::B => Slot::A,
         }
@@ -54,6 +60,7 @@ impl Slot {
 
     pub fn from_suffix(s: &str) -> Option<Slot> {
         match s {
+            "" => Some(Slot::Only),
             "_a" => Some(Slot::A),
             "_b" => Some(Slot::B),
             _ => None,
@@ -72,10 +79,11 @@ pub struct BootSlots {
     pub successful: [bool; 2],
 }
 
-/// The booted slot, or `None` on devices that are not A/B.
+/// The slot the phone runs from: the one place an A-only phone carries,
+/// or the named slot of one that has two.
 pub fn current_slot() -> Result<Option<Slot>> {
     match skyward_block::slot_suffix()? {
-        None => Ok(None),
+        None => Ok(Some(Slot::Only)),
         Some(s) => Slot::from_suffix(&s).map(Some).ok_or_else(|| anyhow!("slot suffix {s:?}")),
     }
 }

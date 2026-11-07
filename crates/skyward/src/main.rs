@@ -5,6 +5,8 @@ use skyward_sys::{bcb, Power};
 use skyward_vab::SnapshotState;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(test, target_os = "android"))]
+mod backlight;
 #[cfg(target_os = "android")]
 mod backup;
 #[cfg(target_os = "android")]
@@ -372,6 +374,11 @@ fn main() -> Result<()> {
         #[cfg(target_os = "android")]
         Cmd::Data { credential, close: false } => {
             use skyward_crypto::data;
+            // The table the data partition is read from comes off the
+            // ramdisk's own configuration, the one this image was built
+            // with, before anything asks what the phone says about /data.
+            let cfg = DeviceConfig::load(&Path::new("/").join(ramdisk::CONFIG))?;
+            skyward_block::fstab::set_files(&cfg.block.fstab_files);
             let binder = skyward_binder::driver::Binder::open()?;
             let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
             let opening = data::open_without_credential(&service)?;
@@ -474,6 +481,11 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// names, only those this phone's build of the hardware runs are started.
 #[cfg(target_os = "android")]
 fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+    // The table a phone keeps of its own filesystems is read from where the
+    // configuration says it is, before anything below asks what the phone
+    // says about a partition. Where the configuration names none, the
+    // Qualcomm pair the recovery has always read is kept.
+    skyward_block::fstab::set_files(&cfg.block.fstab_files);
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
     let props = skyward_info::installed_props(slot)?;
@@ -489,7 +501,14 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     // The drivers ask for their firmware by name, and the kernel looks only
     // in folders of its own unless told to pass on what it does not find
     // there to ueventd, which looks in the recovery's firmware folders.
-    std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
+    // A kernel built without that switch has no file to write: what needs
+    // firmware then fails where it is asked for, which the driver says,
+    // rather than the whole of the bring-up ending here as it did.
+    if Path::new(FIRMWARE_FALLBACK).exists() {
+        std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
+    } else {
+        skyward_sys::kmsg(&format!("{FIRMWARE_FALLBACK} is not here; firmware reaches a driver only from the kernel's own folders"))?;
+    }
     if let Some(firmware) = &cfg.firmware {
         mount_firmware(&firmware.partition)?;
     }
@@ -717,6 +736,9 @@ fn recovery() -> Result<()> {
             // partitions the system asks for, as in Android's own recovery:
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
+            // An A-only phone carries one copy of every partition and no slot
+            // suffix; its logical partitions are named without one, which is
+            // what Slot::Only stands for.
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
                 prepare(&cfg, booted_slot()?)?;
             }

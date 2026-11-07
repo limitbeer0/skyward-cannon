@@ -721,7 +721,9 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
 
 fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let slot = skyward_vab::current_slot()?.context("the phone has no slot to flash")?;
+    let partitions = image::partitions(kind, dir, slot)?;
+    let _ = skyward_sys::kmsg(&format!("image {kind:?} of {size} bytes: partitions {partitions:?}, slot {slot:?}"));
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
     }
@@ -736,12 +738,18 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
     let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
-    image::flash(&mut file, size, &devices, &mut |done, total| {
+    let mut progress = |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
             ctx.send(Event::Progress(Stage::Flashing { done, total }));
             told = Some(Instant::now());
         }
-    })?;
+    };
+    // A sparse image stands for the data it would be written as: super
+    // reaches a phone that way, and the partition takes the data.
+    match kind {
+        ImageKind::Sparse => image::flash_sparse(&mut file, size, &devices, &mut progress)?,
+        _ => image::flash(&mut file, size, &devices, &mut progress)?,
+    }
     Ok(Done::Decided(Outcome::Flashed { partition, slots }))
 }
 

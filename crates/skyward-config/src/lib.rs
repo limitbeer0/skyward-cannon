@@ -41,6 +41,10 @@ pub struct DeviceConfig {
     pub touch: Touch,
     #[serde(default)]
     pub partitions: Partitions,
+    /// Where the phone keeps the table of its own filesystems, on phones
+    /// that name it after their SoC rather than Qualcomm's way.
+    #[serde(default)]
+    pub block: Block,
     /// Where the firmware the phone's drivers ask for is, on phones whose
     /// recovery leaves it out of their reach.
     #[serde(default)]
@@ -82,7 +86,10 @@ pub struct DeviceConfig {
 pub struct Stock {
     /// The build's version, such as OS4.0.4.0.XPACNXM.
     pub version: String,
-    /// Where the package is downloaded from, over HTTPS.
+    /// Where the package is downloaded from, over HTTPS. A phone the
+    /// recovery's maker has only a local image of names none, and then the
+    /// stock recovery has to be given to the packer by hand.
+    #[serde(default)]
     pub package: String,
     /// The recovery partition's SHA-256, in lowercase hex.
     pub recovery: String,
@@ -190,9 +197,15 @@ pub struct Wipe {
 /// The data partition, which the folders erasing takes in are in.
 const DATA: &str = "/data";
 
+/// [`DATA`] as the phone's root names it, without the separator that leads to
+/// it: what the first folder of a path inside the data partition is.
+const DATA_NAME: &str = "data";
+
 /// The vibration motor's click, played through the kernel's force-feedback
 /// events: a waveform its driver keeps, or one made from samples at the
 /// motor's resonant frequency, which the driver plays as they are given.
+/// A driver that takes a duration instead — the kernel's timed-output or LED
+/// interface, or one of its own beside the bus — is named by its folder.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
     /// The driver's number for a click waveform it keeps, on phones whose
@@ -204,6 +217,21 @@ pub struct Haptics {
     /// from samples.
     #[serde(default)]
     pub resonance: Option<String>,
+    /// The folder the driver takes a vibration through, as the kernel's own
+    /// interface gives it: `duration` and `activate` under it, or an `enable`
+    /// file for the timed-output kind, which the K30 Pro's driver is.
+    #[serde(default)]
+    pub sysfs: Option<String>,
+    /// How long a click lasts through that interface, in milliseconds.
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    /// The waveform the driver keeps, by its number, for drivers that play
+    /// one by index rather than by force-feedback effect number.
+    #[serde(default)]
+    pub wave: Option<u32>,
+    /// The driver's own activation mode to set before playing.
+    #[serde(default)]
+    pub mode: Option<u32>,
     pub strength: Strength,
 }
 
@@ -302,6 +330,11 @@ impl Default for Modules {
 /// something before a recovery can read touches from it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Touch {
+    /// Input devices by name that are not the touchscreen, though they report
+    /// themselves as one: the virtual panel a phone's own touch driver makes
+    /// beside the real one, which a recovery would otherwise take for it.
+    #[serde(default)]
+    pub ignore: Vec<String>,
     /// What is written once the touchscreen's input device has appeared,
     /// each value to its file: the driver makes that device as the last
     /// step of starting the controller.
@@ -317,6 +350,21 @@ pub struct Partitions {
     /// them starts.
     #[serde(default)]
     pub mounted: Vec<String>,
+}
+
+/// What the recovery reads of the phone's own storage: where its table of
+/// filesystems is, which says where each one is and how it is mounted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Block {
+    /// The files holding the phone's own table, read together in the order
+    /// given, as a Qualcomm phone's vendor and odm copies are. A phone
+    /// names its table after its SoC or its storage controller, so one
+    /// phone's file is another's absence. Naming none keeps the Qualcomm
+    /// pair, which is what every phone without this section reads: those
+    /// phones' tables are found nowhere else, and a phone's own first-stage
+    /// init reads just this one file.
+    #[serde(default)]
+    pub fstab_files: Vec<String>,
 }
 
 /// A program from the phone's own partitions that the recovery keeps
@@ -467,6 +515,69 @@ fn default_module_sources() -> Vec<String> {
     vec!["vendor_boot".into(), "vendor_dlkm".into(), "vendor".into()]
 }
 
+/// The folders of a path as the phone's own Linux would read it, and whether
+/// it starts at the phone's root: nothing, if the path is not one the phone
+/// could read at all.
+///
+/// A configuration is written for the phone but read on a computer that is
+/// not the phone, and a path read as that computer's own is read wrong there:
+/// a Windows host takes `/data` as a folder of whichever drive it was asked
+/// from rather than an absolute one, treats `\` as a separator, and reads
+/// `C:` as a path's prefix. So the sections that name files of the phone
+/// split on the phone's separator instead, and reach the same reading of the
+/// same configuration wherever the configuration is read: the phone's.
+fn phone_path(path: &str) -> Option<(bool, Vec<&str>)> {
+    // A backslash is one character of a name on the phone and a separator on
+    // the computers the phone's maker also ships, so a path holding one is
+    // refused rather than read two ways. An empty folder is a doubled or a
+    // trailing separator, which no section here means.
+    if path.contains('\\') {
+        return None;
+    }
+    let (rooted, below) = match path.strip_prefix('/') {
+        Some(below) => (true, below),
+        None => (false, path),
+    };
+    let folders: Vec<&str> = below.split('/').collect();
+    folders.iter().all(|f| !f.is_empty()).then_some((rooted, folders))
+}
+
+/// Whether a path names its folders down to one file of the phone's, without
+/// a step back out of the folder it starts in: `.` and `..` name steps, not
+/// folders, and a configuration checked for a plain path means neither.
+fn plain(folders: &[&str]) -> bool {
+    !folders.is_empty() && folders.iter().all(|f| *f != "." && *f != "..")
+}
+
+/// Whether a configuration names a file of the phone by its absolute path: a
+/// plain path from the phone's root. The phone's root itself names no file,
+/// and a path with a trailing separator or a step back is refused.
+fn phone_file(path: &str) -> bool {
+    phone_path(path).is_some_and(|(rooted, folders)| rooted && plain(&folders))
+}
+
+/// Whether a configuration names a file of the phone by a path from the
+/// phone's root, plain or not: the file a driver says a value in, which one
+/// section asks no more of than that it is reached from the root.
+fn phone_absolute(path: &str) -> bool {
+    phone_path(path).is_some_and(|(rooted, _)| rooted)
+}
+
+/// Whether a configuration names a place below one folder of the phone by its
+/// path from the top of that folder: a plain path that does not start at the
+/// phone's root, the way a name below a partition's mount point is written.
+fn phone_below(path: &str) -> bool {
+    phone_path(path).is_some_and(|(rooted, folders)| !rooted && plain(&folders))
+}
+
+/// Whether a configuration names a folder inside the data partition by its
+/// path from the phone's root: a plain path of more than the data partition's
+/// own name, so that neither the partition itself nor a step back out of it
+/// erases with the logs.
+fn phone_folder_in_data(path: &str) -> bool {
+    phone_path(path).is_some_and(|(rooted, folders)| rooted && plain(&folders) && folders.len() > 1 && folders[0] == DATA_NAME)
+}
+
 impl DeviceConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref();
@@ -478,12 +589,7 @@ impl DeviceConfig {
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
         for log in &cfg.wipe.logs {
-            let path = Path::new(log);
-            let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-            ensure!(
-                path.is_absolute() && plain && path.starts_with(DATA) && path != Path::new(DATA),
-                "[wipe] logs: {log} is not a folder inside {DATA}"
-            );
+            ensure!(phone_folder_in_data(log), "[wipe] logs: {log} is not a folder inside {DATA}");
         }
         for name in &cfg.backup.efs {
             ensure!(!name.is_empty() && !name.contains('/'), "[backup] efs: {name} is not a partition's name");
@@ -494,6 +600,9 @@ impl DeviceConfig {
         }
         for name in &cfg.partitions.mounted {
             ensure!(!name.is_empty() && !name.contains('/'), "[partitions] mounted: {name} is not a partition's name");
+        }
+        for file in &cfg.block.fstab_files {
+            ensure!(phone_file(file), "[block] fstab_files: {file} is not an absolute path to a file");
         }
         for s in cfg.services.iter().filter(|s| s.oneshot) {
             let waits = s.ready_property.is_some() || s.ready_service.is_some() || s.ready_hardware_service.is_some();
@@ -513,17 +622,19 @@ impl DeviceConfig {
             }
         }
         for folder in &cfg.backup.data_skipped {
-            let path = Path::new(folder);
-            let plain = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-            ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
+            ensure!(phone_below(folder), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            ensure!(
-                haptics.click.is_some() != haptics.resonance.is_some(),
-                "[haptics] names either a waveform the driver keeps or the file it says the motor's resonant frequency in"
-            );
+            // A motor the driver takes a duration for needs neither a waveform
+            // nor a resonant frequency: the interface is named instead.
+            if haptics.sysfs.is_none() {
+                ensure!(
+                    haptics.click.is_some() != haptics.resonance.is_some(),
+                    "[haptics] names either a waveform the driver keeps or the file it says the motor's resonant frequency in"
+                );
+            }
             if let Some(file) = &haptics.resonance {
-                ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+                ensure!(phone_absolute(file), "[haptics] resonance: {file} is not an absolute path");
             }
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
@@ -533,9 +644,7 @@ impl DeviceConfig {
         }
         if let Some(logd) = &cfg.logd {
             for library in &logd.libraries {
-                let path = Path::new(library);
-                let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[logd] libraries: {library} is not an absolute path to a file");
+                ensure!(phone_file(library), "[logd] libraries: {library} is not an absolute path to a file");
             }
         }
         for owners in &cfg.owners {
@@ -545,19 +654,24 @@ impl DeviceConfig {
             ensure!(owners.mode <= 0o7777, "[[owners]] mode {:o} is not a file's mode", owners.mode);
             ensure!(!owners.paths.is_empty(), "[[owners]] for {}:{} names no file", owners.user, owners.group);
             for file in &owners.paths {
-                let path = Path::new(file);
-                let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
+                ensure!(phone_file(file), "[[owners]] paths: {file} is not an absolute path to a file");
             }
         }
         if let Some(stock) = &cfg.stock {
-            let name = stock.package.rsplit('/').next().unwrap_or_default();
-            ensure!(
-                stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version) && !stock.version.is_empty(),
-                "[stock] package: {} is not an HTTPS address of the full package of {}",
-                stock.package,
-                stock.version
-            );
+            ensure!(!stock.version.is_empty(), "[stock] version: a build's version is named");
+            // A phone whose full package no one has measured a download
+            // address for names none: its stock recovery then comes from a
+            // local image, given to the packer by hand. What is named must
+            // still be the package of the build named.
+            if !stock.package.is_empty() {
+                let name = stock.package.rsplit('/').next().unwrap_or_default();
+                ensure!(
+                    stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version),
+                    "[stock] package: {} is not an HTTPS address of the full package of {}",
+                    stock.package,
+                    stock.version
+                );
+            }
             ensure!(
                 stock.recovery.len() == 64 && stock.recovery.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
                 "[stock] recovery: {} is not a SHA-256 in lowercase hex",
@@ -567,20 +681,16 @@ impl DeviceConfig {
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
             for file in &wlan.firmware {
-                let name = Path::new(&file.name);
-                let plain = name.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-                ensure!(plain && !file.name.is_empty(), "[wlan] firmware: {} is not a name from the top of the loader's folders", file.name);
-                let path = Path::new(&file.path);
+                ensure!(phone_below(&file.name), "[wlan] firmware: {} is not a name from the top of the loader's folders", file.name);
                 match &file.partition {
                     Some(partition) => {
-                        let plain = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
                         ensure!(
                             !partition.is_empty() && !partition.contains('/'),
                             "[wlan] firmware: {partition} is not a partition's name"
                         );
-                        ensure!(plain && !file.path.is_empty(), "[wlan] firmware: {} is not a path from the top of {partition}", file.path);
+                        ensure!(phone_below(&file.path), "[wlan] firmware: {} is not a path from the top of {partition}", file.path);
                     }
-                    None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
+                    None => ensure!(phone_absolute(&file.path), "[wlan] firmware: {} is not an absolute path", file.path),
                 }
             }
         }
@@ -593,6 +703,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_phones_paths_mean_the_same_on_every_host_that_reads_them() {
+        // The checks a configuration is put through ask the phone's own
+        // Linux about paths, not the computer reading the file: a Windows
+        // host, where `/data/miuilog` is a folder of whichever drive it was
+        // asked from, refused nezha's own configuration for it, and the
+        // packer run there fails the same way the tests did.
+        for phone in [
+            include_str!("../../../devices/nezha.toml"),
+            include_str!("../../../devices/ishtar.toml"),
+            include_str!("../../../devices/cannon.toml"),
+        ] {
+            let cfg = DeviceConfig::parse(phone).expect("a phone's own paths are the phone's");
+            for log in &cfg.wipe.logs {
+                assert!(phone_folder_in_data(log), "{log} is inside {DATA}");
+            }
+            for file in cfg.block.fstab_files.iter().chain(cfg.logd.iter().flat_map(|l| &l.libraries)) {
+                assert!(phone_file(file), "{file} is a file of the phone's");
+            }
+            for folder in &cfg.backup.data_skipped {
+                assert!(phone_below(folder), "{folder} is below the data partition's top");
+            }
+        }
+        // What the phone's own init would not read either: a host's path
+        // with its drive and its own separator, and a path that steps back
+        // out of the folder it is checked to be in, are refused wherever
+        // they are read.
+        assert!(DeviceConfig::parse("[device]\ncodename = \"x\"\n[wipe]\nlogs = [\"C:\\\\data\\\\miuilog\"]\n").is_err());
+        for bad in ["/data/../system", "/data/./log", "/data//log", "/data/log/"] {
+            let text = format!("[device]\ncodename = \"x\"\n[wipe]\nlogs = [\"{bad}\"]\n");
+            assert!(DeviceConfig::parse(&text).is_err(), "{bad} is refused");
+        }
+    }
+
+    #[test]
     fn parses_minimal() {
         let cfg = DeviceConfig::parse("[device]\ncodename = \"nezha\"\n").unwrap();
         assert_eq!(cfg.device.codename, "nezha");
@@ -602,6 +746,27 @@ mod tests {
         assert!(cfg.modules.load.is_empty());
         assert_eq!((cfg.firmware, cfg.wlan, cfg.update), (None, None, None), "a phone may have none of them");
         assert_eq!(cfg.logd, None, "a recovery's own logd usually has all it needs");
+        assert!(cfg.block.fstab_files.is_empty(), "a phone that names no table is read where a Qualcomm phone's table is");
+    }
+
+    #[test]
+    fn the_table_a_phone_keeps_can_be_named_after_its_soc() {
+        let base = "[device]\ncodename = \"x\"\n[block]\n";
+        let cannon = DeviceConfig::parse(&format!("{base}fstab_files = [\"/vendor/etc/fstab.mt6853\", \"/vendor/etc/fstab.emmc\"]\n")).unwrap();
+        assert_eq!(cannon.block.fstab_files, ["/vendor/etc/fstab.mt6853", "/vendor/etc/fstab.emmc"]);
+        assert_eq!(
+            DeviceConfig::parse(&format!("{base}fstab_files = []\n")).unwrap().block.fstab_files,
+            Vec::<String>::new(),
+            "an empty list is the Qualcomm pair, not a phone that reads no table at all"
+        );
+        for bad in ["vendor/etc/fstab.x", "/", "/vendor/../etc/fstab.x", "/vendor/etc/", ""] {
+            assert!(DeviceConfig::parse(&format!("{base}fstab_files = [\"{bad}\"]\n")).is_err(), "{bad} is refused");
+        }
+        // One file is enough for a phone whose table lives in one place: the
+        // list is a list because a Qualcomm phone's table is kept in two, not
+        // because a phone must name two.
+        let one = DeviceConfig::parse(&format!("{base}fstab_files = [\"/vendor/etc/fstab.mt6853\"]\n")).unwrap();
+        assert_eq!(one.block.fstab_files.len(), 1, "a phone naming one file reads one file");
     }
 
     #[test]
@@ -844,6 +1009,28 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_only_local_images_of_is_still_a_stock_build() {
+        // Cannon's build is known, and its recovery partition as downloaded
+        // and hashed by hand; only its full package's address is not, and an
+        // address invented to pass a check would send the packer elsewhere.
+        let base = "[device]\ncodename = \"x\"\n[stock]\nversion = \"V14.0.6.0.SJECNXM\"\n";
+        let hash = "6585fca210a39e462d710d569d3540af8bc6109a83215f5a87155556933efcac";
+        let local = DeviceConfig::parse(&format!("{base}recovery = \"{hash}\"\n")).unwrap().stock.unwrap();
+        assert_eq!((local.version.as_str(), local.package.as_str()), ("V14.0.6.0.SJECNXM", ""), "the package the recovery is made on is unnamed");
+        // A version is the build's own name: the packer compares the image it
+        // is handed against the hash, so an unnamed package leaves the version
+        // as the only thing saying which build this recovery is made on.
+        assert!(
+            DeviceConfig::parse("[device]\ncodename = \"x\"\n[stock]\nversion = \"\"\nrecovery = \"{hash}\"\n").is_err(),
+            "a stock build names the version it is of"
+        );
+        assert!(
+            DeviceConfig::parse(&format!("{base}recovery = \"{}\"\n", hash.to_uppercase())).is_err(),
+            "an unnamed package is no reason to relax the hash"
+        );
+    }
+
+    #[test]
     fn the_firmware_partition_is_named_plainly() {
         let base = "[device]\ncodename = \"x\"\n[firmware]\n";
         assert!(DeviceConfig::parse(&format!("{base}partition = \"modem\"\n")).is_ok());
@@ -906,6 +1093,60 @@ mod tests {
         assert_eq!(cfg.services[6].ready_hardware_service.as_deref(), Some("android.hardware.boot@1.2::IBootControl/default"));
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
         assert!(cfg.backup.data_skipped.contains(&"vendor/tzstorage".to_string()));
+    }
+
+    #[test]
+    fn parses_cannon() {
+        // The packer reaches the same configuration through `load`, reading
+        // it from the folder it sits in: parsing text read into memory does
+        // not prove a host that reads paths differently from the phone takes
+        // the file the same way, which is what failed on a Windows host.
+        let text = include_str!("../../../devices/cannon.toml");
+        let cfg = DeviceConfig::parse(text).unwrap();
+        let loaded = DeviceConfig::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices/cannon.toml")).unwrap();
+        assert_eq!(loaded.device.codename, cfg.device.codename, "the file and its text are read alike");
+        assert!(!cfg.device.ab, "one of each partition, no slot the table's paths are of");
+        assert_eq!(cfg.device.os_version_prop, "ro.build.version.incremental", "its MIUI version property is empty");
+        assert_eq!((cfg.display.width, cfg.display.height, cfg.display.density), (1080, 2340, 440));
+        assert_eq!(cfg.modules.sources, ["vendor"], "the vendor partition is the only module source this phone has");
+        assert!(cfg.modules.load.is_empty(), "its touchscreen driver is built into the kernel");
+        assert!(cfg.touch.writes.is_empty(), "its controller reports positions itself");
+        assert_eq!(cfg.block.fstab_files, ["/vendor/etc/fstab.mt6853", "/vendor/etc/fstab.emmc"], "its table is named after its SoC, not its maker's chipset vendor");
+        assert_eq!(cfg.stock.as_ref().map(|s| (s.version.as_str(), s.package.as_str())), Some(("V14.0.6.0.SJECNXM", "")), "the build is known and its recovery hashed; its package's address is not");
+        assert_eq!(cfg.backup.efs, ["nvram", "protect1", "protect2", "nvcfg", "nvdata"]);
+        assert_eq!(cfg.update.expect("the Chinese system's update server is the same as the Qualcomm phones' here").server, "https://update.miui.com/updates/miotaV3.php");
+        // What is deliberately left out, checked so that adding a guess to
+        // the file shows up here instead of passing unnoticed.
+        assert_eq!((cfg.firmware, cfg.haptics), (None, None), "no modem partition to mount, and no force-feedback device to click with");
+        assert_eq!(
+            cfg.services.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(),
+            [
+                "/system_root/system/bin/hwservicemanager",
+                "/vendor/bin/teei_daemon",
+                "/vendor/bin/hw/android.hardware.keymaster@4.1-service.beanpod",
+                "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service",
+            ],
+            "the chain measured on the phone: its directory of hardware services, its trusted environment's daemon, and the two services reached through it"
+        );
+        assert_eq!(cfg.services[0].ready_property.as_deref(), Some("hwservicemanager.ready"));
+        assert_eq!(cfg.services[2].ready_hardware_service.as_deref(), Some("android.hardware.keymaster@4.1::IKeymasterDevice/default"));
+        assert_eq!(cfg.services[2].registers, ["android.hardware.keymaster@4.0::IKeymasterDevice/default"], "its rc says it answers for both kinds");
+        assert!(cfg.partitions.mounted.is_empty() && cfg.owners.is_empty(), "nothing is mounted or handed over ahead of programs this phone does not run");
+    }
+
+    #[test]
+    fn a_phone_that_names_no_table_is_read_where_a_qualcomm_phone_keeps_its_own() {
+        // The fallback is what the two Qualcomm phones here have always read;
+        // a configuration that leaves the section out must not change that.
+        for text in [
+            include_str!("../../../devices/nezha.toml"),
+            include_str!("../../../devices/ishtar.toml"),
+        ] {
+            let cfg = DeviceConfig::parse(text).unwrap();
+            assert!(cfg.block.fstab_files.is_empty(), "{} names no table", cfg.device.codename);
+        }
+        let stock = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap().stock.unwrap();
+        assert!(stock.package.starts_with("https://"), "a phone with a measured package keeps its address");
     }
 
     #[test]

@@ -920,12 +920,21 @@ pub enum Pick {
 impl Pick {
     pub const ALL: [Pick; 3] = [Pick::Current, Pick::Other, Pick::Both];
 
+    /// The choices where the phone runs from one copy of every partition:
+    /// the one it runs from, and nothing else to pick.
+    pub const ONLY: [Pick; 1] = [Pick::Current];
+
     /// The slots this means on a phone running from `current`.
     pub fn slots(self, current: Slot) -> Vec<Slot> {
         match self {
             Pick::Current => vec![current],
             Pick::Other => vec![current.other()],
-            Pick::Both => vec![Slot::A, Slot::B],
+            // A phone with one copy of every partition has no second one to
+            // put an image in: both slots is the one it runs from.
+            Pick::Both => match current {
+                Slot::Only => vec![Slot::Only],
+                _ => vec![Slot::A, Slot::B],
+            },
         }
     }
 }
@@ -1062,6 +1071,9 @@ pub const TIME_ZONES: [(Text, Text, &str); 9] = [
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     Open(Screen),
+    /// Save what the panel shows as a picture, on a button rather than a key
+    /// chord, whose power half some phones take for their own reset.
+    Screenshot,
     /// Leave the decrypt page for the page it was opened from; the page
     /// the recovery started on, for the home page without keeping it
     /// behind.
@@ -4749,6 +4761,9 @@ impl App {
             }
             Action::Confirm(_) => self.say(l.pick(["请按住圆形按钮向右滑动", "請按住圓形按鈕向右滑動", "Hold the round button and slide it right"]), now),
             Action::Slider(_) | Action::Pattern => {}
+            Action::Screenshot => {
+                return vec![Effect::Screenshot { storage: self.state.place_open(Place::Storage) }];
+            }
             Action::Sideload => match self.state.install {
                 Install::Idle | Install::Finished { .. } => {
                     self.begin_install(Install::Starting, Source::Computer, None);
@@ -5762,6 +5777,8 @@ impl App {
         self.fling = None;
         self.end_turn();
         if let Some((first, at)) = self.chord {
+            // The power key and volume down together take a picture, as the
+            // stock system does; neither does anything else until let go.
             if matches!((first, key), (Key::Power, Key::VolumeDown) | (Key::VolumeDown, Key::Power)) && now < at + CHORD_MS {
                 return self.screenshot(key, now);
             }
@@ -5781,6 +5798,10 @@ impl App {
             return fx;
         }
         self.stir(now);
+        // The keys a screenshot is taken with wait for their partner: the
+        // power key with volume down, and the two volume keys together, which
+        // a phone whose power key rests on the chip's own reset can use
+        // instead.
         if matches!(key, Key::Power | Key::VolumeDown) {
             self.chord = Some((key, now));
             return fx;

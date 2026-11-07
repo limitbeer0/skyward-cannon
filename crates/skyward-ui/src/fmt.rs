@@ -891,6 +891,14 @@ pub fn image_kind(l: Lang, kind: ImageKind) -> (&'static str, &'static str) {
         }
         ImageKind::Dtbo => (["dtbo 镜像", "dtbo 映像檔", "dtbo image"], ["包含设备树叠加层", "包含裝置樹疊加層", "Holds device tree overlays"]),
         ImageKind::Vbmeta => (["vbmeta 镜像", "vbmeta 映像檔", "vbmeta image"], ["包含启动验证数据", "包含啟動驗證資料", "Holds verified boot data"]),
+        ImageKind::Raw => (
+            ["分区镜像", "分割區映像檔", "Partition image"],
+            ["镜像内容原样写入所选分区", "映像檔內容原樣寫入所選分割區", "Written into the chosen partition as it is"],
+        ),
+        ImageKind::Sparse => (
+            ["稀疏镜像", "稀疏映像檔", "Sparse image"],
+            ["分区数据按块压缩存放，写入时展开", "分割區資料按區塊壓縮存放，寫入時展開", "Partition data in compressed chunks, expanded as it is written"],
+        ),
     };
     (l.pick(name), l.pick(holds))
 }
@@ -1409,14 +1417,13 @@ pub fn screenshots_not_kept(l: Lang, why: &str) -> String {
 pub fn screenshot_name(unix_ms: i64, zone: usize) -> String {
     let t = local(unix_ms.div_euclid(1000), zone);
     format!(
-        "Screenshot_{:04}-{:02}-{:02}-{:02}-{:02}-{:02}-{:03}_Skyward.png",
+        "Screenshot_{:04}-{:02}-{:02}-{:02}-{:02}-{:02}.png",
         t.year(),
         t.month(),
         t.day(),
         t.hour(),
         t.minute(),
-        t.second(),
-        unix_ms.rem_euclid(1000)
+        t.second()
     )
 }
 

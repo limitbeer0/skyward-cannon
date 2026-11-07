@@ -1,0 +1,265 @@
+# Redmi Note 9 5G (cannon): MediaTek MT6853, Android 12, kernel 4.14.336.
+# Unlike every phone here this one is not of Qualcomm: it has no A/B slots,
+# no modem partition, no cnss, and no AIDL key service. The sections those
+# phones carry are left out rather than filled with what would not hold,
+# and where a value is a guess and not a measurement it says so.
+
+[device]
+codename = "cannon"
+brand = "REDMI"
+# The phone's own ro.product.model is M2007J22C. Its marketname reads
+# "Redmi Note 9", the 5G left off as the 4G phone of the same name shares
+# it; the marketed name is written out so the About page says what people
+# look their phone for.
+model = "Redmi Note 9 5G"
+# No androidboot.slot_suffix, no boot control halves, one of each partition:
+# the phone boots its system as Android's recovery did before A/B.
+ab = false
+# TODO: the SoC's marketing name is not read off this phone's own About
+# page, and the page shows exactly what this names, so it is left out rather
+# than written from a datasheet. What is measured is ro.boot.hardware, which
+# is mt6853.
+# soc = { hans = "...", hant = "...", en = "..." }
+# This build's ro.mi.os.version.incremental, which the Qualcomm phones here
+# ask, is empty: asking it would leave the About page showing nothing where
+# the vendor's version is asked.
+os_version_prop = "ro.build.version.incremental"
+
+[display]
+# wm size and wm density, as the running system reports them.
+width = 1080
+height = 2340
+density = 440
+diagonal = 6.53
+# TODO: 0 rounds no page's corners, so a page sliding over another keeps
+# them square. The Qualcomm phones here take theirs from the stock
+# settings' overlay (rounded_corner_radius); this phone's has not been read.
+corner_radius = 0
+
+# The touchscreen's driver is built into the kernel
+# (CONFIG_XIAOMI_SPI_TOUCH=y, CONFIG_TOUCHSCREEN_NT36xxx_HOSTDL_SPI=y), so
+# there is nothing for a recovery to load: its input device,
+# /dev/input/event2, is there before the recovery starts. The vendor's
+# module folder is still named, as that is where the modules are on this
+# phone and where the WLAN's drivers wait for it to load them.
+[modules]
+sources = ["vendor"]
+load = []
+
+# The NVTCapacitiveTouchScreen controller reports positions itself, so a
+# recovery reads touches as soon as the input device is opened. Its driver's
+# knobs are /proc/nvt_baseline, /proc/nvt_diff and /proc/nvt_fw_version,
+# which are nothing like the Qualcomm enable_touch_raw a recovery has to
+# write before touches come in; what the phone's own touch service writes to
+# these, if anything, is not measured.
+[touch]
+writes = []
+
+# The phone's own table. Two files are there, named after its SoC and after
+# its storage controller; they differ only in the lines the generator left
+# of which file each came from, so reading both names every filesystem twice
+# over with the same line, and the first naming a partition is the one used.
+# Naming none here would fall back to the fstab.qcom pair, which this phone
+# keeps nowhere, and every mount, every filesystem fix and every wipe would
+# then find no table at all.
+#
+# What its /data line says, as the phone writes it:
+#   /dev/block/by-name/userdata /data f2fs
+#   noatime,nosuid,nodev,discard,noflush_merge,fsync_mode=nobarrier,
+#   reserve_root=134217,resgid=1065,inlinecrypt
+#   wait,check,formattable,quota,reservedsize=128m,latemount,resize,
+#   checkpoint=fs,fileencryption=aes-256-xts:aes-256-cts:v1
+# It names no metadata_encryption and no keydirectory: the phone wraps no
+# whole block device, and the kernel's inline encryption is what keeps the
+# files. Its /metadata line is of ext4, not the f2fs the Qualcomm phones'
+# tables give, so erasing that partition makes what this table says.
+[block]
+fstab_files = ["/vendor/etc/fstab.mt6853", "/vendor/etc/fstab.emmc"]
+
+# No [firmware]: the Qualcomm phones here name the partition their radios'
+# firmware and their secure world's apps are on, which their recovery
+# leaves unmounted. This phone keeps no such partition to mount: its
+# processor images are whole partitions of their own (md1img, scp1, sspm_1,
+# audio_dsp, cam_vpu1..3) that hold no filesystem a recovery mounts, and the
+# firmware its drivers ask the loader for is under the vendor partition,
+# which comes mounted with the system.
+
+# No [partitions] mounted: the Qualcomm phones here mount persist before
+# their programs start because the secure world keeps its files there.
+# TODO: which of this phone's own mount points a program Skyward starts
+# needs is not measured, and naming one on a guess mounts a partition whose
+# files nothing here opens; it comes with the [[service]] section below.
+
+# TODO: this WLAN is a guess, never brought up in a recovery on this phone.
+# It is not Qualcomm's cnss — there is no /sys/kernel/cnss/fs_ready — but
+# MediaTek's WMT over a MT6631/MT6635, whose modules the vendor partition
+# carries: wmt_drv.ko, wmt_chrdev_wifi.ko, wlan_drv_gen4m.ko,
+# bt_drv_connac1x.ko, connfem.ko, gps_drv.ko, fmradio_drv_mt6631_6635.ko.
+# The order below is the order they depend on each other in as their names
+# say (the WMT bus, then its WLAN chardevice, then the driver), which is not
+# the same as their modules.dep saying it; what WMT needs besides the modules
+# is unmeasured, and the switch it is told to bring the chip up by is
+# /dev/wmtWifi with a value of the form "1on" — the node's name and the value
+# are what a MTK kernel answers to, not what was read off this phone.
+#
+# The supplicant is the vendor's own, and of the older kind: the vendor
+# partition carries android.hardware.wifi.supplicant@1.0..1.4.so and no AIDL
+# one, so the service below is named HIDL's way, where the Qualcomm phones
+# here name AIDL's. Whether the recovery's directory takes a description of
+# that kind is the WLAN task's to try before this is believed; joining a
+# network has not been attempted.
+[wlan]
+modules = ["wmt_drv", "wmt_chrdev_wifi", "wlan_drv_gen4m"]
+writes = [{ path = "/dev/wmtWifi", value = "1on" }]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant@1.0::ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+# TODO: the two libraries are taken from nezha, whose stock recovery leaves
+# them out of its own library folder so its logd ends as soon as init starts
+# it. Whether this phone's recovery carries them has not been checked; if it
+# does, the section should go, and the logd would start as ishtar's does.
+# Starting it is not fatal here: a logd that will not come up leaves only
+# what the phone's own programs log unkept.
+[logd]
+libraries = ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]
+
+# The update server the stock updater of the Chinese system asks.
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+# The stock build this recovery is made on. TODO: no measured download
+# address of this build's full OTA package is known — what exists of it here
+# is the offline package, at
+# E:\cannon_images_V14.0.6.0.SJECNXM_20231017.0000.00_12.0_cn\images — and an
+# address copied from another phone's build would send the packer to a
+# package whose recovery is not the one this recovery is built on top of. An
+# unnamed package means the stock recovery.img has to be handed to the packer
+# by hand.
+#
+# The hash is of that recovery.img: 134217728 bytes, the whole partition,
+# hashed here from the file rather than taken from anywhere. The phone's own
+# recovery partition, once the OrangeFox that was on it was flashed back to
+# the official image, reads byte for byte the same as that file, so the value
+# names this build's recovery and not a third-party one.
+[stock]
+version = "V14.0.6.0.SJECNXM"
+package = ""
+recovery = "6585fca210a39e462d710d569d3540af8bc6109a83215f5a87155556933efcac"
+
+# The partitions a backup takes of the baseband's settings, the phone's own
+# identity and the sensors' calibration: nvram, protect1, protect2, nvcfg and
+# nvdata are all in the phone's by-name folder as measured, and nvram is
+# where a MTK phone keeps what modemst1 and modemst2 are of a Qualcomm one.
+# persist is left out of this list, as it is of a Qualcomm phone's, because
+# what it holds here is not measured.
+#
+# TODO: which folders of the data partition the secure world keeps in step
+# with itself is not measured on this phone: the names below are where a MTK
+# phone's trusted environment and its fingerprint app are known to keep
+# theirs. Naming a folder that is not there costs a backup leaving it out;
+# naming one that is, whose older copy the secure world refuses to reopen,
+# costs a fingerprint that stops working, so this list is the one to check
+# against the phone's own /data (readable with adb root) before it is
+# trusted. Measured already: /data/system_de/0 holds no spblob, so this build
+# has no synthetic-password protector and its users' secrets take the older
+# password path — which of the folders below that changes is not known.
+[backup]
+efs = ["nvram", "protect1", "protect2", "nvcfg", "nvdata"]
+data_skipped = ["vendor/optee", "vendor/tee", "vendor/fpd", "vendor/fingerprint"]
+
+# Where the phone's own programs keep logs in the data partition. TODO: not
+# measured item by item. /data/miuilog is Xiaomi's log manager and /data/xlogs
+# what it leaves of each part of the phone; /data/anr and /data/tombstones are
+# the system's own crash records, which the Qualcomm phones here find under
+# /data/vendor instead. A folder that is not there is passed over as erasing
+# goes, so the cost of naming one wrongly is a folder's logs staying, not an
+# erase failing.
+[wipe]
+logs = [
+    "/data/miuilog",
+    "/data/xlogs",
+    "/data/vendor/log",
+    "/data/anr",
+    "/data/tombstones",
+]
+
+# No [haptics]. The phone does have a motor — an AW8622 behind
+# /sys/class/leds/vibrator, whose max_brightness is 255 and which answers to
+# activate and duration — but the click Skyward plays here goes through the
+# kernel's force-feedback events, and this phone gives none: getevent -p
+# shows no device with them, only mtk-pmic-keys, and no entry of
+# /proc/bus/input/devices has the bit for force feedback. Naming a waveform
+# the driver keeps, or the file a driver says the motor's resonant frequency
+# in, would both ask for a device that is not there; the phone's motor wants
+# a back end of the LEDs class, which no recovery here runs yet.
+
+# No [[service]] was written here until the chain was measured on the phone
+# itself (2026-11-01): the system's own directory program reaches its
+# libraries only through the /system_root view the recovery gives the mounted
+# system, and the runtime bundle the loader asks for is opened where it lies,
+# both done by the recovery's own bringing-up before it starts services. The
+# secure world of this phone answers over HIDL, so each service below is
+# named HIDL's way.
+#
+# The order is what the phone's own init uses: the directory first, then the
+# trusted environment's daemon, then the services that talk through it.
+[[service]]
+# The installed system's own, run through the /system_root view so its
+# linker finds its libraries; it opens the driver's filesystem itself where
+# the recovery has not.
+path = "/system_root/system/bin/hwservicemanager"
+user = "system"
+groups = ["system", "readproc"]
+ready_property = "hwservicemanager.ready"
+
+# The trusted environment's daemon, with the trustlet ids its own rc gives
+# it (measured from /vendor/etc/init/microtrust.rc on the phone, 2026-11-01).
+[[service]]
+path = "/vendor/bin/teei_daemon"
+args = [
+    "-r", "020b0000000000000000000000000000",
+    "-r", "020f0000000000000000000000000000",
+    "-r", "06090000000000000000000000000000",
+    "-r", "05120000000000000000000000000000",
+    "-r", "40188311faf343488db888ad39496f9a",
+    "-r", "07060000000000000000000000007169",
+    "-r", "4be4f7dc1f2c11e5b5f7727283247c7f",
+    "-r", "9073f03a9618383bb1856eb3f990babd",
+    "-r", "08050000000000000000000000003419",
+    "-r", "5020170115e016302017012521300000",
+    "-r", "0f5eed3c3b5a47afacca69a84bf0efad",
+    "-r", "07407000000000000000000000000000",
+    "-r", "05160000000000000000000000000000",
+    "-r", "91dba524a6e24909acc48abd7163121a",
+    "-r", "57f02fe81d5a11ea8d23d7abe98b8462",
+    "-r", "08070000000000000000000000008270",
+    "-r", "09080000000000000000000000009381",
+    "-t", "08030000000000000000000000000000",
+    "-t", "85f630e0f0964c5fa2cc268ce04e3da3",
+    "-t", "98fb95bcb4bf42d26473eae48690d7ea",
+    "-t", "7b66512021214487ba710a51d7ea78fe",
+    "-t", "09010000000000000000000000000000",
+]
+user = "system"
+groups = ["system"]
+
+# The key service of the older kind, which answers for both 4.0 and 4.1 of
+# its interface as its rc says (measured 2026-11-01). Nothing opens /data
+# through it yet — that is the decryption task's — but the gatekeeper
+# behind the lock-screen password shares its secure world, and a phone
+# whose directory has no key service registered answers nothing.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.keymaster@4.1-service.beanpod"
+user = "system"
+groups = ["system", "drmrpc"]
+ready_hardware_service = "android.hardware.keymaster@4.1::IKeymasterDevice/default"
+registers = ["android.hardware.keymaster@4.0::IKeymasterDevice/default"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
+user = "system"
+groups = ["system"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"

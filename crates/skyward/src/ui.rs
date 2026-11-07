@@ -68,7 +68,8 @@ const STORAGE_LOGS: &str = "Skyward/logs";
 const SCREENSHOTS: &str = "DCIM/Screenshots";
 const HELD_SCREENSHOTS: &str = "/tmp/screenshots";
 
-/// The panel backlight under /sys/class/backlight.
+/// The panel backlight, at the node [`crate::backlight`] finds for this
+/// phone's kernel.
 struct Backlight {
     path: PathBuf,
     /// The raw level at the top of the slider: the panel's normal maximum.
@@ -79,18 +80,7 @@ struct Backlight {
 
 impl Backlight {
     fn open() -> Result<Self> {
-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
-            .context("read /sys/class/backlight")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<_>>()?;
-        dirs.sort();
-        // Qualcomm panels expose panel0-backlight; take it when present.
-        let dir = dirs
-            .iter()
-            .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
-            .or(dirs.first())
-            .ok_or_else(|| anyhow!("no backlight device"))?
-            .clone();
+        let dir = crate::backlight::node(Path::new("/sys"))?;
         let read = |name: &str| -> Result<u32> {
             fs::read_to_string(dir.join(name))
                 .with_context(|| format!("read {}/{name}", dir.display()))?
@@ -98,7 +88,7 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let top = crate::backlight::top(Path::new("/sys"), Path::new("/proc"), read("max_brightness")?)?;
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -114,55 +104,6 @@ impl Backlight {
         }
         Ok(())
     }
-}
-
-/// How a panel's node in the device tree may give its normal maximum: the
-/// property holding it, and the one holding the whole range on the same
-/// scale. The 13 Ultra's panel gives both on a finer scale of its own that
-/// spans the same light as the backlight's range; the 17 Ultra's gives them
-/// on the backlight's own scale. The panels of the Xiaomi 13 and 15, of the
-/// 14 and the K80 series and one of the K90's give it only as the level
-/// their factory tests drive the panel to, on the backlight's own scale:
-/// the 13 Ultra's panels give that level as well, and it comes to the same
-/// half of their range as the normal maximum they give.
-const NORMAL_MAX: [(&str, &str); 3] = [
-    ("mi,normal-max-brightness-clone", "mi,max-brightness-clone"),
-    ("mi,max-brightness-normal", "qcom,mdss-dsi-bl-max-level"),
-    ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
-];
-
-/// The raw backlight level, out of `max`, at the panel's normal maximum.
-/// Above it the panel runs in high brightness mode, which the stock system
-/// keeps for strong sunlight and its slider does not reach. The panel the
-/// display driver booted with gives that maximum in the device tree.
-fn normal_max(max: u32) -> Result<u32> {
-    let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
-    // The panel's node, then its configuration after a colon, as in
-    // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
-    // without the colon either.
-    let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
-    let soc = Path::new("/proc/device-tree/soc");
-    let node = fs::read_dir(soc)
-        .with_context(|| format!("read {}", soc.display()))?
-        .map(|e| e.map(|e| e.path().join(name)))
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .find(|p| p.is_dir())
-        .ok_or_else(|| anyhow!("panel {name} is not in the device tree"))?;
-    let cell = |prop: &str| -> Result<u32> {
-        let path = node.join(prop);
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let cell: [u8; 4] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is not one cell", path.display()))?;
-        Ok(u32::from_be_bytes(cell))
-    };
-    let (normal, full) = NORMAL_MAX
-        .iter()
-        .find(|(normal, _)| node.join(normal).exists())
-        .with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
-    let (normal, full) = (cell(normal)?, cell(full)?);
-    ensure!(normal > 0 && normal <= full, "panel {name}: normal maximum {normal} out of {full}");
-    Ok((f64::from(max) * f64::from(normal) / f64::from(full)).round() as u32)
 }
 
 /// Leave recovery for the chosen target.
@@ -1028,7 +969,19 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
-    let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+    // A phone whose driver plays no force-feedback events, as MediaTEK's
+    // vibrator does not, runs the pages without the clicks: they are a
+    // polish on the touch, and losing them says less on the screen than a
+    // recovery that never comes up. Why goes to stderr, which the log kept
+    // from the start takes in; the kernel log could say it no better, and
+    // failing there is too small a reason yet to lose the motor's clicks.
+    let mut haptics = match cfg.haptics.as_ref().map(Haptics::open).transpose() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("no clicks from the motor: {e:#}");
+            None
+        }
+    };
     let mut backlight = Backlight::open()?;
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,

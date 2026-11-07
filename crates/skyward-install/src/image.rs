@@ -17,6 +17,9 @@ const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 /// A dtbo image starts with this, big-endian.
 const DTBO_MAGIC: &[u8] = &[0xd7, 0xb7, 0xab, 0x1e];
 const VBMETA_MAGIC: &[u8] = b"AVB0";
+/// A sparse image, as the update packages on the phone maker's server hold
+/// super in: little-endian magic, then a header and chunks of data.
+const SPARSE_MAGIC: &[u8] = &[0x3a, 0xff, 0x26, 0xed];
 
 /// How a ramdisk is packed, by its first bytes: LZ4 in the legacy framing
 /// Android uses or the standard one, gzip, or a bare newc archive.
@@ -42,7 +45,34 @@ pub enum ImageKind {
     VendorBoot,
     Dtbo,
     Vbmeta,
+    /// A sparse image, the way a super partition reaches a phone: chunks of
+    /// data between instructions to repeat a value or leave blocks alone.
+    Sparse,
+    /// An image no header of its own names: a filesystem image of a
+    /// partition, which is written where its holder says it goes.
+    Raw,
 }
+
+/// The partitions a plain image can be written to, likeliest first: the
+/// ones a mistake in costs an install rather than the phone's own identity,
+/// its keys or the owner's files. What holds what makes the phone a phone is
+/// left to the bootloader, which asks for each by name.
+const RAW_PARTITIONS: [&str; 14] = [
+    "super",
+    "system",
+    "vendor",
+    "product",
+    "odm",
+    "system_ext",
+    "boot",
+    "recovery",
+    "dtbo",
+    "vbmeta",
+    "vbmeta_system",
+    "modem",
+    "cust",
+    "logo",
+];
 
 /// The ramdisk a boot image carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +97,10 @@ impl ImageKind {
             ImageKind::VendorBoot => &["vendor_boot"],
             ImageKind::Dtbo => &["dtbo"],
             ImageKind::Vbmeta => &["vbmeta", "vbmeta_system", "vbmeta_vendor"],
+            // A sparse image stands for the blocks of one partition, which
+            // is super's on most phones and any of them on others.
+            ImageKind::Sparse => &RAW_PARTITIONS,
+            ImageKind::Raw => &RAW_PARTITIONS,
         }
     }
 }
@@ -97,7 +131,12 @@ pub fn detect<R: Read + Seek>(file: &mut R, head: &[u8]) -> Result<Option<ImageK
     if head.starts_with(VBMETA_MAGIC) {
         return Ok(Some(ImageKind::Vbmeta));
     }
-    Ok(None)
+    if head.starts_with(SPARSE_MAGIC) {
+        return Ok(Some(ImageKind::Sparse));
+    }
+    // Anything else that is not a package is an image of a partition: its
+    // holder names which one, out of all of them the phone has.
+    Ok(Some(ImageKind::Raw))
 }
 
 /// Whether a packed ramdisk is a recovery's, by the names in its archive.
@@ -160,21 +199,131 @@ pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
     dir.join(format!("{name}{}", slot.suffix()))
 }
 
-/// The partitions `kind` fits that this phone has in both slots, among the
-/// links in `dir`, the likeliest first.
-pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
+/// The partitions `kind` fits that this phone has, among the links in `dir`,
+/// the likeliest first. On an A/B phone a partition counts where both slots
+/// hold it, since an image written to one alone leaves the other stale; on
+/// one with a single copy of every partition, where that copy is there.
+pub fn partitions(kind: ImageKind, dir: &Path, slot: Slot) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in kind.partitions() {
-        let mut has = true;
-        for slot in [Slot::A, Slot::B] {
-            let path = device(dir, name, slot);
-            has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
-        }
+        let has = match slot {
+            Slot::Only => device(dir, name, slot).try_exists().with_context(|| format!("look for {}", device(dir, name, slot).display()))?,
+            _ => {
+                let mut both = true;
+                for slot in [Slot::A, Slot::B] {
+                    let path = device(dir, name, slot);
+                    both &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
+                }
+                both
+            }
+        };
         if has {
             found.push(*name);
         }
     }
     Ok(found)
+}
+
+/// Write a sparse image out as the data it stands for: `image` holds the
+/// header's own lengths and the chunks after it, `len` its whole size, and
+/// each device is written the blocks the chunks add up to.
+pub fn flash_sparse<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    ensure!(!devices.is_empty(), "no partition to write");
+    let mut outs = Vec::with_capacity(devices.len());
+    for path in devices {
+        let f = OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
+        let size = f.metadata().with_context(|| format!("stat {}", path.display()))?.len();
+        outs.push((path, f, size));
+    }
+    image.seek(SeekFrom::Start(0)).context("rewind the image")?;
+    let mut fixed = [0u8; 28];
+    image.read_exact(&mut fixed).context("read the sparse header")?;
+    let word = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().expect("four bytes"));
+    let size = |at: usize| u16::from_le_bytes(fixed[at..at + 2].try_into().expect("two bytes"));
+    ensure!(fixed[..4] == *SPARSE_MAGIC, "not a sparse image");
+    let (header, chunk_header) = (size(8) as u64, size(10) as u64);
+    let block = u64::from(word(12));
+    let blocks = u64::from(word(16));
+    let out_len = block * blocks;
+    for (path, _, size) in &outs {
+        ensure!(out_len <= *size, "the image holds {out_len} bytes, more than the {size} its partition holds: {}", path.display());
+    }
+    let mut read = 28u64;
+    let mut pos = 0u64;
+    let mut done = 0u64;
+    let mut copy = vec![0u8; CHUNK];
+    while read < len {
+        let at = image.stream_position().context("find the chunk")?;
+        let mut head = [0u8; 12];
+        image.read_exact(&mut head).with_context(|| format!("read the chunk at {at}"))?;
+        let kind = u16::from_le_bytes(head[0..2].try_into().expect("two bytes"));
+        let count = u64::from(u32::from_le_bytes(head[4..8].try_into().expect("four bytes")));
+        let total = u64::from(u32::from_le_bytes(head[8..12].try_into().expect("four bytes")));
+        ensure!(total >= 12, "a chunk of {total} bytes holds no data at {at}");
+        let _ = chunk_header;
+        match kind {
+            // Raw: the chunk's own bytes.
+            0xCAC1 => {
+                let mut left = count * block;
+                while left > 0 {
+                    let n = left.min(CHUNK as u64) as usize;
+                    image.read_exact(&mut copy[..n]).context("read a raw chunk")?;
+                    for (_, f, _) in outs.iter_mut() {
+                        f.seek(SeekFrom::Start(pos)).context("seek the partition")?;
+                        f.write_all(&copy[..n]).context("write the partition")?;
+                    }
+                    pos += n as u64;
+                    done += n as u64;
+                    left -= n as u64;
+                    progress(done, out_len);
+                }
+            }
+            // Fill: one value written out `count` times.
+            0xCAC2 => {
+                image.read_exact(&mut copy[..4]).context("read a fill chunk")?;
+                let mut left = count * block;
+                let unit: Vec<u8> = (0..CHUNK).map(|i| copy[i % 4]).collect();
+                while left > 0 {
+                    let n = left.min(CHUNK as u64) as usize;
+                    for (_, f, _) in outs.iter_mut() {
+                        f.seek(SeekFrom::Start(pos)).context("seek the partition")?;
+                        f.write_all(&unit[..n]).context("write the partition")?;
+                    }
+                    pos += n as u64;
+                    done += n as u64;
+                    left -= n as u64;
+                    progress(done, out_len);
+                }
+            }
+            // Don't care: the blocks stay as they are, which on a partition
+            // to be written whole means zeroes.
+            0xCAC3 => {
+                let mut left = count * block;
+                while left > 0 {
+                    let n = left.min(CHUNK as u64) as usize;
+                    for (_, f, _) in outs.iter_mut() {
+                        f.seek(SeekFrom::Start(pos)).context("seek the partition")?;
+                        f.write_all(&vec![0u8; n]).context("write the partition")?;
+                    }
+                    pos += n as u64;
+                    done += n as u64;
+                    left -= n as u64;
+                    progress(done, out_len);
+                }
+            }
+            // Checksum only: no data follows.
+            0xCAC4 => {
+                let mut crc = [0u8; 4];
+                image.read_exact(&mut crc).context("read a checksum chunk")?;
+            }
+            other => bail!("a sparse chunk of kind {other:#x} at {at} is not one this writes"),
+        }
+        read += total;
+    }
+    for (path, f, _) in outs.iter_mut() {
+        f.sync_all().with_context(|| format!("flush {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Write `len` bytes of `image` to all of `devices` in one pass, then read

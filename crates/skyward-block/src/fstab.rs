@@ -3,9 +3,42 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Where the phone's own partitions keep the table.
+/// Where the phone's own partitions keep the table, on a Qualcomm phone.
+/// Other SoCs name it differently: a MediaTek phone names its tables after
+/// its SoC and its storage controller, so the device's configuration may
+/// give other files instead; see [`set_files`].
 pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+
+/// The files [`set_files`] gave, once it did; until then tables are read
+/// from [`FILES`]. Where the table is kept is a fact of the whole run rather
+/// than a parameter of every caller, because the callers are not one part of
+/// the recovery: mounting, repairing a filesystem and erasing the phone's
+/// data all read this table, in several crates, and the device's
+/// configuration is read once, as the recovery starts, before any of them
+/// asks. The phone's own first-stage init finds one named file the same way.
+static GIVEN: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Read the phone's tables from `files` instead of [`FILES`]. The recovery
+/// service calls it once, as it starts, with what the device's
+/// configuration names; a configuration naming no files keeps the Qualcomm
+/// pair, so every phone without the section is read as it always was. A
+/// later call changes nothing: init starts the recovery service again after
+/// a failure, and the second run must read the tables the first did.
+pub fn set_files(files: &[String]) {
+    if !files.is_empty() {
+        let _ = GIVEN.set(files.to_vec());
+    }
+}
+
+/// The files the phone's tables are read from, now.
+fn files() -> Vec<String> {
+    GIVEN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| FILES.iter().map(|f| f.to_string()).collect())
+}
 
 /// One filesystem the phone knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,8 +86,15 @@ pub fn entries(text: &str) -> Vec<Entry> {
 
 /// Every entry of the phone's own table, read from wherever the table is.
 fn table() -> Result<Vec<Entry>> {
+    read_files(&files())
+}
+
+/// Every entry of the tables named in `files`, in the order they are
+/// given: a phone's data partition is of the filesystem its own table
+/// says, which one table names and another may not.
+fn read_files(files: &[String]) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    for file in FILES {
+    for file in files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -165,5 +205,77 @@ mod tests {
     fn comments_and_short_lines_are_passed_over() {
         assert!(entries("# nothing\n\n/dev/x /y f2fs rw\n").is_empty());
         assert_eq!(entries(TABLE).len(), 3);
+    }
+
+    /// A folder holding the tables `named`, each written as its own file.
+    /// A name not given is absent, as a phone's odm table is when the phone
+    /// keeps its table in one place only.
+    fn tables(named: &[(&str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("skyward-fstab-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, text) in named {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn the_tables_a_phone_names_are_read_in_that_order_and_an_absent_one_passed_over() {
+        let vendor = "/dev/block/by-name/userdata /data f2fs noatime wait,check,formattable\n";
+        let odm = "/dev/block/by-name/cache /cache ext4 noatime wait,check,formattable\n";
+        let root = tables(&[("fstab.mt6853", vendor), ("fstab.emmc", odm)]);
+        let given = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| root.join(n).to_string_lossy().into_owned()).collect()
+        };
+        let read = |names: &[&str]| -> Vec<Entry> { read_files(&given(names)).unwrap() };
+        assert_eq!(read(&["fstab.mt6853", "fstab.emmc"]).len(), 2, "both tables are read");
+        assert_eq!(read(&["fstab.mt6853", "fstab.emmc"])[0].mount_point, "/data", "in the order given");
+        assert_eq!(read(&["fstab.emmc", "fstab.mt6853"])[0].mount_point, "/cache", "which comes first is the configuration's to say");
+        assert_eq!(read(&["absent", "fstab.emmc"]).len(), 1, "a table the phone keeps nowhere else is passed over");
+        // A file that is there but cannot be read is a fault of the phone's,
+        // not an absence: passing it over would leave a partition the
+        // recovery goes on mounting from a table it never read.
+        assert!(read_files(&given(&["fstab.mt6853/absent"])).is_err(), "a folder is no table");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_configuration_that_names_no_files_keeps_the_qualcomm_pair_and_the_first_call_wins() {
+        // Which files to read is a fact of the whole run, held once. This is
+        // the only test that gives any, so what it finds before its first
+        // call is what every other test, and every phone whose configuration
+        // names none, reads.
+        assert_eq!(files(), FILES, "a phone that names nothing is read as it always was");
+        let mt6853: Vec<String> = ["/vendor/etc/fstab.mt6853", "/vendor/etc/fstab.emmc"].map(str::to_string).into();
+        set_files(&[]);
+        assert_eq!(files(), FILES, "naming none changes nothing");
+        set_files(&mt6853);
+        assert_eq!(files(), mt6853, "the files a phone's configuration names are the ones read");
+        set_files(&["/vendor/etc/fstab.qcom".to_string()]);
+        assert_eq!(
+            files(),
+            mt6853,
+            "a second call changes nothing: init starts the recovery service again after a failure, and the second run must read the tables the first did"
+        );
+    }
+
+    #[test]
+    fn what_a_mediatek_table_says_of_its_data_and_metadata_is_read_as_it_is() {
+        // Cannon's own two lines, as its /vendor/etc/fstab.mt6853 keeps them.
+        let table = "\
+/dev/block/by-name/metadata /metadata ext4 noatime,nosuid,nodev,discard wait,check,formattable,first_stage_mount
+/dev/block/by-name/userdata /data f2fs noatime,nosuid,nodev,discard,noflush_merge,fsync_mode=nobarrier,reserve_root=134217,resgid=1065,inlinecrypt wait,check,formattable,quota,reservedsize=128m,latemount,resize,checkpoint=fs,fileencryption=aes-256-xts:aes-256-cts:v1
+";
+        let [metadata, data] = &entries(table)[..] else { panic!("two lines, two entries") };
+        assert_eq!(
+            (metadata.mount_point.as_str(), metadata.filesystem.as_str()),
+            ("/metadata", "ext4"),
+            "erasing it makes what its own table says, not the f2fs a Qualcomm phone's table says"
+        );
+        assert_eq!((data.mount_point.as_str(), data.filesystem.as_str()), ("/data", "f2fs"));
+        assert_eq!(data.extra("fileencryption"), Some("aes-256-xts:aes-256-cts:v1"));
+        assert_eq!(data.extra("keydirectory"), None, "the files' names are encrypted by the filesystem itself");
+        assert_eq!(data.extra("metadata_encryption"), None, "the phone's block device is not wrapped at all");
+        assert!(data.options.iter().any(|o| o == "inlinecrypt"), "the kernel's inline encryption, not a dm-crypt layer");
     }
 }

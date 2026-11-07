@@ -84,6 +84,18 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 ///
 /// `wanted` names the hardware services that will be asked for.
 pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+    // A phone whose installed system is itself the whole of its system
+    // partition keeps the system's files one folder deeper than the
+    // recovery's loader looks for them: the recovery's linker reads the
+    // phone's libraries from /system_root/system, which is what the mounted
+    // system is named there. Where the mounted system says so of itself,
+    // give it that name.
+    let phone = skyward_vab::mount_point("system");
+    if phone.join("system/lib64").is_dir() && !Path::new("/system_root/system/lib64").exists() {
+        let at = Path::new("/system_root");
+        fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+        skyward_block::mount::bind(&phone, at).with_context(|| format!("read {} as {}", phone.display(), at.display()))?;
+    }
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's

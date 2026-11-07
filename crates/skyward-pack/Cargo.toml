@@ -14,7 +14,14 @@ abootimg-oxide = "0.5.2"
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 cpio = "0.4.1"
+# A device's kernel unpacks its ramdisk only in the formats its own
+# CONFIG_RD_* options allow, so the packer has to write them itself; the host
+# has no external compressor to call and none may be installed.
+flate2 = "1.1.10"
 lz4_flex = "0.14.0"
+# A header up to version 2 carries its own digest of the sections after it,
+# which has to be taken again over the ramdisk the packer wrote.
+sha1 = "0.10.7"
 sha2 = "0.10.9"
 skyward-config = { path = "../skyward-config" }
 tempfile = "3.27.0"
