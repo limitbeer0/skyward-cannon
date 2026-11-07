@@ -238,9 +238,12 @@ logs = [
 # the recovery has not.
 path = "/system_root/system/bin/hwservicemanager"
 libraries = ["/system_root/system/lib64", "/vendor/lib64"]
-user = "system"
-groups = ["system", "readproc"]
 ready_property = "hwservicemanager.ready"
+# The directory registers itself as the binder context manager, which on a
+# kernel this old asks for root: a system user is refused, and the program
+# aborts before it serves a single call.
+user = "root"
+groups = ["root"]
 
 # The trusted environment's daemon, with the trustlet ids its own rc gives
 # it (measured from /vendor/etc/init/microtrust.rc on the phone, 2026-11-01).

@@ -144,7 +144,11 @@ impl<'a> Gatekeeper<'a> {
     pub fn open(binder: &'a skyward_binder::driver::Binder, hardware: &'a skyward_binder::driver::Binder) -> Result<Gatekeeper<'a>> {
         use skyward_binder::{hidl, service};
         let not_running = |name: &str| format!("{name} is not running; the phone's credential service has to be started first");
-        if service::declared(binder, SERVICE)? {
+        // The newer kind is asked of the framework's directory; where the
+        // recovery runs no such directory, the call that asks is refused, and
+        // the older kind is what the phone has. A refusal is taken as "no" so
+        // the older kind is reached rather than the whole ending here.
+        if service::declared(binder, SERVICE).unwrap_or(false) {
             let device = service::find(binder, SERVICE)?.with_context(|| not_running(SERVICE))?;
             return Ok(Gatekeeper::Newer(device));
         }
