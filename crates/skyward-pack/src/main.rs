@@ -62,6 +62,11 @@ enum Cmd {
         /// phone or a full update package holds it, ending in its AVB footer.
         #[arg(long)]
         stock: PathBuf,
+        /// A kernel to take in place of the stock image's own: a boot image
+        /// or a bare Image.gz-dtb, as a phone built on a different tree from
+        /// the stock one needs.
+        #[arg(long)]
+        kernel: Option<PathBuf>,
         /// Skyward built for the device (aarch64-linux-android).
         #[arg(long)]
         binary: PathBuf,
@@ -127,9 +132,21 @@ fn main() -> Result<()> {
             }
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, config, font, mono, mono_license, ramdisk_compression, out } => {
+        Cmd::Recovery { stock, kernel, binary, config, font, mono, mono_license, ramdisk_compression, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
+            // A kernel named in its own right takes the stock image's place:
+            // a phone whose secure world was built against a different tree
+            // from the one the stock kernel reads needs the one that tree
+            // built. A boot image holds its kernel; a bare Image or
+            // Image.gz-dtb is taken as it is.
+            if let Some(at) = &kernel {
+                img.kernel = if BootImage::read(at).is_ok() {
+                    BootImage::read(at)?.kernel
+                } else {
+                    std::fs::read(at).with_context(|| format!("read {}", at.display()))?
+                };
+            }
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
             // A device's kernel reads its ramdisk only in the formats its own
             // configuration built, so the archive goes back in the one the
