@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// The driver every program on the phone reaches its neighbours through.
 const DEVICE: &str = "/dev/binder";
@@ -16,6 +17,7 @@ const HARDWARE: [&str; 2] = ["/dev/hwbinder", "/dev/binderfs/hwbinder"];
 /// than as a plain node: mounted as the phone's own init mounts it, which a
 /// recovery started without that init has not done.
 const BINDERFS: &str = "/dev/binderfs";
+static BINDERFS_MOUNT: Mutex<()> = Mutex::new(());
 
 /// The layout this crate speaks. The driver refuses a program that knows a
 /// different one.
@@ -132,13 +134,16 @@ impl Binder {
     }
 
     /// Mount the binder driver's own filesystem where the phone keeps it,
-    /// as its init does before any program reaches a driver node. Where it
-    /// is already mounted, or the kernel has no such filesystem at all,
-    /// say so rather than fail: what asked for the driver says what it
-    /// wanted it for.
+    /// as its init does before any program reaches a driver node. Reuse the
+    /// existing mount so clients and service managers share one context.
     pub fn binderfs() -> Result<()> {
         use std::ffi::CString;
-        let at = std::path::Path::new(BINDERFS);
+        let _mount = BINDERFS_MOUNT.lock().expect("binderfs mount lock poisoned");
+        let at = Path::new(BINDERFS);
+        // A second mount can succeed and hide the first one's devices.
+        if at.join("binder-control").exists() {
+            return Ok(());
+        }
         std::fs::create_dir_all(at).with_context(|| format!("make {BINDERFS}"))?;
         let (src, dst, ty) = (CString::new("binder").unwrap(), CString::new(BINDERFS).unwrap(), CString::new("binder").unwrap());
         // Nothing asked of the driver besides its own nodes: the features
@@ -147,8 +152,7 @@ impl Binder {
         // phones refuse a mount that names a feature they do not know.
         if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), 0, std::ptr::null()) } != 0 {
             let err = std::io::Error::last_os_error();
-            // EBUSY means it is mounted already, which is what was wanted.
-            if err.raw_os_error() != Some(libc::EBUSY) {
+            if err.raw_os_error() != Some(libc::EBUSY) || !at.join("binder-control").exists() {
                 return Err(err).context("mount the binder driver's filesystem");
             }
         }
@@ -195,8 +199,11 @@ impl Binder {
             flags: TF_ACCEPT_FDS,
             data_size: payload.len() as u64,
             offsets_size: (addresses.len() * 8) as u64,
-            buffer: payload.as_ptr() as u64,
-            offsets: addresses.as_ptr() as u64,
+            // Strip the top-byte tag the bionic allocator puts on heap
+            // pointers, as the binder driver of an older kernel checks the
+            // whole address against the user address space.
+            buffer: (payload.as_ptr() as u64) & 0x00FF_FFFF_FFFF_FFFF,
+            offsets: (addresses.as_ptr() as u64) & 0x00FF_FFFF_FFFF_FFFF,
             ..TransactionData::default()
         };
         // A call that hands over addresses is sent the way that tells the

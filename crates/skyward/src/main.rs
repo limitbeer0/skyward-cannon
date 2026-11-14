@@ -170,6 +170,13 @@ enum Cmd {
     /// credential and changes nothing.
     #[cfg(target_os = "android")]
     Gatekeeper,
+    /// Look up a hardware service by name and say whether it answered, which
+    /// reads no credential and changes nothing.
+    #[cfg(target_os = "android")]
+    Hidl { name: String },
+    /// Verify the device and credential-free user keys on an already mounted fscrypt v1 filesystem.
+    #[cfg(target_os = "android")]
+    FbeV1 { mount: PathBuf },
     /// Say what the phone's weaver says of itself, which reads no slot and
     /// changes nothing.
     #[cfg(target_os = "android")]
@@ -347,6 +354,23 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
+        Cmd::Hidl { name } => {
+            let hardware = skyward_binder::driver::Binder::hardware()?;
+            // The name is an fqname like "android.hardware.gatekeeper@1.0::IGatekeeper"
+            let iface_name = name.split('/').next().unwrap_or(&name);
+            match skyward_binder::hidl::find(&hardware, iface_name, "default")? {
+                Some(_) => println!("found {iface_name}/default"),
+                None => println!("no {iface_name}/default registered"),
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::FbeV1 { mount } => {
+            skyward_crypto::data::install_fbe_v1_keys(&mount)?;
+            println!("fscrypt v1 device and user keys installed");
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
         Cmd::Gatekeeper => {
             let (binder, hardware) = (skyward_binder::driver::Binder::open()?, skyward_binder::driver::Binder::hardware()?);
             let gatekeeper = skyward_crypto::gatekeeper::Gatekeeper::open(&binder, &hardware)?;
@@ -387,9 +411,7 @@ fn main() -> Result<()> {
             // with, before anything asks what the phone says about /data.
             let cfg = DeviceConfig::load(&Path::new("/").join(ramdisk::CONFIG))?;
             skyward_block::fstab::set_files(&cfg.block.fstab_files);
-            let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
-            let opening = data::open_without_credential(&service)?;
+            let opening = decrypt::open().map_err(anyhow::Error::msg)?;
             match &opening.mounted {
                 Some(mounted) => {
                     if let Some(checked) = &mounted.checked {
@@ -403,7 +425,8 @@ fn main() -> Result<()> {
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
             if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = data::unlock(&service, &closed, user, credential.as_bytes())?;
+                closed = decrypt::with_key_service(|service| data::unlock(service, &closed, user, credential.as_bytes()))
+                    .map_err(anyhow::Error::msg)?;
             }
             for c in &closed {
                 match &c.why {

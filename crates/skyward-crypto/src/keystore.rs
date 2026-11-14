@@ -69,8 +69,12 @@ impl StoredKey {
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+        let stretching = dir.join(FN_STRETCHING);
+        match fs::read_to_string(&stretching) {
+            Ok(mode) if matches!(mode.trim(), "none" | "nopassword") => {}
+            Ok(_) => bail!("{} was written by an Android too old for Skyward to read", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("read {}", stretching.display())),
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
@@ -246,6 +250,19 @@ mod tests {
         let s = StoredKey::load(&dir).unwrap();
         assert!(s.secdiscardable_hash.is_empty());
         assert_eq!(s.unwrap(Unwrap::<NoService>::Secret(b"only the secret")).unwrap(), key.to_vec());
+    }
+
+    #[test]
+    fn legacy_keys_without_scrypt_use_the_existing_application_id() {
+        let dir = tempdir("legacy-app-id");
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
+        fs::write(dir.join(FN_SECDISCARDABLE), b"fixture").unwrap();
+        for mode in ["nopassword", "none"] {
+            fs::write(dir.join(FN_STRETCHING), mode).unwrap();
+            let key = StoredKey::load(&dir).unwrap();
+            assert_eq!(key.app_id(&[]), hash_with_prefix(SECDISCARDABLE_PREFIX, b"fixture"));
+        }
     }
 
     /// Why loading the directory was turned down.

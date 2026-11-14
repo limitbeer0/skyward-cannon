@@ -316,6 +316,6 @@ METADATA_SIZE=1024
         assert!(identify(Cursor::new(squeezed)).is_err());
         let other = zip_with(&[("readme.txt", b"hello", CompressionMethod::Stored)]);
         assert_eq!(identify(Cursor::new(other)).unwrap(), Package::Unknown);
-        assert_eq!(identify(Cursor::new(b"just some text".to_vec())).unwrap(), Package::Unknown);
+        assert_eq!(identify(Cursor::new(b"just some text".to_vec())).unwrap(), Package::Image(image::ImageKind::Raw));
     }
 }

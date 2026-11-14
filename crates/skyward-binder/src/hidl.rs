@@ -50,9 +50,7 @@ impl Message {
         let mut m = Message::default();
         m.data.extend_from_slice(interface.as_bytes());
         m.data.push(0);
-        while !m.data.len().is_multiple_of(4) {
-            m.data.push(0);
-        }
+        m.data.resize(m.data.len().next_multiple_of(4), 0);
         m
     }
 
@@ -71,6 +69,35 @@ impl Message {
         self.framed(at, value.len(), value.len());
     }
 
+    /// A HIDL struct and the payloads of the vectors inside it.
+    pub fn structure(&mut self, value: &[u8], vectors: &[(usize, &[u8], usize)]) {
+        self.structure_with_count(value, None, vectors);
+    }
+
+    /// A HIDL vector of structs, with the child vectors in wire order.
+    pub fn structures(&mut self, value: &[u8], count: usize, vectors: &[(usize, &[u8], usize)]) {
+        self.structure_with_count(value, Some(count), vectors);
+    }
+
+    fn structure_with_count(&mut self, value: &[u8], count: Option<usize>, vectors: &[(usize, &[u8], usize)]) {
+        let mut entries = value.to_vec();
+        let children: Vec<_> = vectors.iter().map(|&(offset, bytes, count)| {
+            let at = self.keep(bytes.to_vec());
+            entries[offset..offset + 8].copy_from_slice(&at.to_le_bytes());
+            entries[offset + 8..offset + 12].copy_from_slice(&(count as u32).to_le_bytes());
+            (offset, at, bytes.len())
+        }).collect();
+        let len = entries.len();
+        let at = self.keep(entries);
+        let parent = match count {
+            Some(count) => self.framed(at, count, len),
+            None => self.address(at, len, None),
+        };
+        for (offset, at, len) in children {
+            self.address(at, len, Some((parent, offset)));
+        }
+    }
+
     /// Text, which is a run of bytes with a terminator the count leaves
     /// out.
     pub fn text(&mut self, value: &str) {
@@ -84,13 +111,19 @@ impl Message {
     fn keep(&mut self, bytes: Vec<u8>) -> u64 {
         let bytes = bytes.into_boxed_slice();
         let at = bytes.as_ptr() as u64;
+        // Strip the top-byte tag: a newer bionic allocator tags its heap
+        // pointers, and the binder driver of an older kernel checks the
+        // whole address against the user address space, so a tagged
+        // pointer is read past its end and the call is refused. The tag is
+        // the hardware's own, and plays no part in where the bytes are.
+        let at = at & 0x00FF_FFFF_FFFF_FFFF;
         self.held.push(bytes);
         at
     }
 
     /// The pair of addresses a run of bytes is written as: the frame, and
     /// then the bytes it points at.
-    fn framed(&mut self, at: u64, count: usize, length: usize) {
+    fn framed(&mut self, at: u64, count: usize, length: usize) -> usize {
         let mut frame = Vec::with_capacity(FRAME_BYTES);
         frame.extend_from_slice(&at.to_le_bytes());
         frame.extend_from_slice(&(count as u32).to_le_bytes());
@@ -98,22 +131,22 @@ impl Message {
         frame.extend_from_slice(&[0; 4]);
         let frame_at = self.keep(frame);
         let parent = self.address(frame_at, FRAME_BYTES, None);
-        self.address(at, length, Some(parent));
+        self.address(at, length, Some((parent, 0)))
     }
 
     /// Write an address among the values and say where it sits, which is
     /// how the driver finds it. The answer is which address this is, for
     /// the one pointing inside it to name.
-    fn address(&mut self, at: u64, length: usize, inside: Option<usize>) -> usize {
+    fn address(&mut self, at: u64, length: usize, inside: Option<(usize, usize)>) -> usize {
         let which = self.addresses.len();
         self.addresses.push(self.data.len() as u64);
         self.data.extend_from_slice(&ADDRESS.to_le_bytes());
         self.data.extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
         self.data.extend_from_slice(&at.to_le_bytes());
         self.data.extend_from_slice(&(length as u64).to_le_bytes());
-        self.data.extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
-        // The address inside the frame is the frame's first field.
-        self.data.extend_from_slice(&0u64.to_le_bytes());
+        let (parent, offset) = inside.unwrap_or_default();
+        self.data.extend_from_slice(&(parent as u64).to_le_bytes());
+        self.data.extend_from_slice(&(offset as u64).to_le_bytes());
         self.pointed += (length as u64).next_multiple_of(WORD);
         which
     }
@@ -161,6 +194,26 @@ impl<'a> Answer<'a> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
 
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+    }
+
+    /// Read a vector of bytes whose frame has already been copied by Binder.
+    pub fn bytes(&mut self) -> Result<&'a [u8]> {
+        let frame = self.pointed()?;
+        anyhow::ensure!(frame.len() == FRAME_BYTES, "wrong HIDL vector frame size");
+        let count = u32::from_le_bytes(frame[8..12].try_into().expect("four bytes")) as usize;
+        let value = self.pointed()?;
+        anyhow::ensure!(value.len() == count, "wrong HIDL byte vector size");
+        Ok(value)
+    }
+
+    /// Read the operation's empty output parameter vector.
+    pub fn empty_vector(&mut self) -> Result<()> {
+        anyhow::ensure!(self.bytes()?.is_empty(), "unexpected HIDL output parameters");
+        Ok(())
+    }
+
     /// A truth value: a byte, padded to four as everything is.
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.take(4)?[0] != 0)
@@ -177,6 +230,9 @@ impl<'a> Answer<'a> {
         }
         let at = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
         let length = u64::from_le_bytes(raw[16..24].try_into().expect("eight bytes"));
+        if length == 0 {
+            return Ok(&[]);
+        }
         if at == 0 {
             bail!("the service left out something the call asked for");
         }
@@ -332,6 +388,21 @@ mod tests {
         let in_frame = u64::from_le_bytes(parts[0].2[0..8].try_into().unwrap());
         let raw = &m.data[m.addresses[1] as usize..];
         assert_eq!(in_frame, u64::from_le_bytes(raw[8..16].try_into().unwrap()));
+    }
+
+    #[test]
+    fn nested_vectors_name_the_array_and_their_field_offsets() {
+        let mut m = Message::call("a.b@1.0::IC");
+        m.structures(&[0; 64], 2, &[(16, b"one", 3), (48, b"two", 3)]);
+        let check = |object: usize, index: u64, offset: u64| {
+            let start = m.addresses[object] as usize;
+            assert_eq!(&m.data[start + 24..start + 32], &index.to_le_bytes());
+            assert_eq!(&m.data[start + 32..start + 40], &offset.to_le_bytes());
+        };
+        check(1, 0, 0);
+        check(2, 1, 16);
+        check(3, 1, 48);
+        assert_eq!(m.pointed(), 96);
     }
 
     #[test]

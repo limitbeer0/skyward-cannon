@@ -7,12 +7,32 @@ use std::path::Path;
 
 /// How long the name the kernel gives a key is.
 pub const NAME_BYTES: usize = 16;
+pub const DESCRIPTOR_BYTES: usize = 8;
 
 /// Let `raw` into the filesystem mounted at `mount`, and give the name the
 /// kernel knows it by. Every file whose directory names that key can be
 /// read from then on.
 #[cfg(target_os = "android")]
 pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTES]> {
+    add(mount, raw, wrapped, None)
+}
+
+/// Install a v1 key after verifying it matches vold's recorded descriptor.
+#[cfg(target_os = "android")]
+pub fn add_v1_key(mount: &Path, raw: &[u8], recorded: Option<&[u8]>) -> Result<()> {
+    use sha2::{Digest, Sha512};
+
+    anyhow::ensure!(raw.len() == 64, "an fscrypt v1 key must be 64 bytes");
+    let hash = Sha512::digest(Sha512::digest(raw));
+    let descriptor = hash[..DESCRIPTOR_BYTES].try_into().expect("eight bytes");
+    if let Some(recorded) = recorded {
+        anyhow::ensure!(recorded == descriptor, "fscrypt v1 key does not match the recorded descriptor");
+    }
+    add(mount, raw, false, Some(descriptor)).map(|_| ())
+}
+
+#[cfg(target_os = "android")]
+fn add(mount: &Path, raw: &[u8], wrapped: bool, descriptor: Option<&[u8; DESCRIPTOR_BYTES]>) -> Result<[u8; NAME_BYTES]> {
     use std::os::fd::AsRawFd;
     /// The request's fixed part, before the key itself.
     const HEADER_BYTES: usize = 80;
@@ -24,7 +44,13 @@ pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTE
     const ADD_KEY: u32 = 0xc050_6617;
 
     let mut arg = vec![0u8; HEADER_BYTES + raw.len()];
-    arg[0..4].copy_from_slice(&BY_IDENTIFIER.to_ne_bytes());
+    let key_spec = if let Some(descriptor) = descriptor {
+        arg[8..8 + DESCRIPTOR_BYTES].copy_from_slice(descriptor);
+        1u32
+    } else {
+        BY_IDENTIFIER
+    };
+    arg[0..4].copy_from_slice(&key_spec.to_ne_bytes());
     arg[40..44].copy_from_slice(&(raw.len() as u32).to_ne_bytes());
     if wrapped {
         arg[76..80].copy_from_slice(&HARDWARE_WRAPPED.to_ne_bytes());

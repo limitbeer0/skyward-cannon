@@ -142,17 +142,31 @@ fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
     Ok((entries, mapped))
 }
 
-/// Map the data partition decrypted without mounting it, for its
-/// filesystem to be repaired, and give the device it is reached through;
-/// [`unmap`] takes it away again. The partition is to be closed.
-pub fn map_unmounted(service: &KeyMint) -> Result<PathBuf> {
+/// Run a filesystem operation on unmounted userdata. A data partition
+/// with file encryption alone can be checked through the physical device.
+pub fn with_unmounted<T>(work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    anyhow::ensure!(!mount::is_mount_point(Path::new(MOUNT))?, "the data partition is mounted");
     anyhow::ensure!(dm::status(MAPPED)?.is_none(), "the data partition is open");
-    map(service).map(|(_, mapped)| mapped)
-}
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let entry = entries.first().context("the phone's own table says nothing about /data")?;
+    if entry.extra("metadata_encryption").is_none() && entry.extra("keydirectory").is_none() {
+        let device = skyward_block::fstab::device(entry)?;
+        let mounted_at = mount::points_of(skyward_block::devnum(&device)?)?;
+        anyhow::ensure!(mounted_at.is_empty(), "{device} is mounted at {}", mounted_at[0].display());
+        return work(Path::new(&device));
+    }
 
-/// Take away the mapping [`map_unmounted`] made.
-pub fn unmap() -> Result<()> {
-    dm::remove(MAPPED)
+    let binder = Binder::open()?;
+    let service = KeyMint::open(&binder)?;
+    let (_, mapped) = map(&service)?;
+    let done = work(&mapped);
+    match dm::remove(MAPPED) {
+        Ok(()) => done,
+        Err(e) => match done {
+            Ok(_) => Err(e),
+            Err(work) => Err(work.context(format!("removing {MAPPED} afterwards failed too: {e:#}"))),
+        },
+    }
 }
 
 /// Show the owner's shared storage at /sdcard; shown already, it stays.
@@ -197,6 +211,82 @@ pub struct Opening {
     pub mounted: Option<Opened>,
     /// The users whose own files are still closed, the owner first.
     pub closed: Vec<Closed>,
+}
+
+/// Whether this fstab describes file encryption v1 on a plain block device.
+pub fn uses_fbe_v1() -> Result<bool> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    Ok(entries.first().is_some_and(|entry| {
+        entry.extra("metadata_encryption").is_none()
+            && entry.extra("keydirectory").is_none()
+            && entry.extra("fileencryption").is_some_and(|mode| {
+                mode.split(':').nth(2).is_some_and(|flags| flags.split('+').any(|flag| flag == "v1"))
+            })
+    }))
+}
+
+/// Install a v1 device key and the keys that vold sealed without a screen credential.
+/// The caller may supply a read-only mount to verify the existing data.
+pub fn install_fbe_v1_keys(root: &Path) -> Result<()> {
+    use crate::fscrypt::{add_v1_key, unlocked};
+    use crate::keymaster::Keymaster;
+
+    let binder = Binder::hardware()?;
+    let service = Keymaster::open(&binder)?;
+    let unencrypted = root.join("unencrypted");
+    let mode = std::fs::read_to_string(unencrypted.join("mode")).context("read the file encryption mode")?;
+    anyhow::ensure!(!crate::fscrypt::hardware_wrapped(mode.trim()), "hardware-wrapped fscrypt v1 keys are unsupported");
+    let install = |dir: &Path, recorded: Option<&[u8]>| -> Result<()> {
+        let raw = StoredKey::load(dir)?.unwrap(Unwrap::Hardware(&service))
+            .with_context(|| format!("unwrap the key in {}", dir.display()))?;
+        add_v1_key(root, &raw, recorded)
+    };
+    let descriptor = std::fs::read(unencrypted.join("ref")).context("read the device key descriptor")?;
+    install(&unencrypted.join("key"), Some(&descriptor))?;
+
+    let users = root.join("misc/vold/user_keys");
+    let de = users.join("de");
+    let entries = std::fs::read_dir(&de).with_context(|| format!("list {}", de.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(user) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        install(&entry.path(), None)?;
+        let ce = users.join("ce").join(name).join("current");
+        let stretching = std::fs::read_to_string(ce.join("stretching"))
+            .with_context(|| format!("read the key layout for user {user}"))?;
+        anyhow::ensure!(stretching.trim() == "nopassword", "user {user} requires a screen credential for fscrypt v1");
+        install(&ce, None)?;
+        let private = root.join("user").join(user.to_string());
+        anyhow::ensure!(unlocked(&private)?, "the installed key did not unlock user {user}");
+    }
+    let owner = root.join("media/0");
+    anyhow::ensure!(owner.is_dir() && unlocked(&owner)?, "the owner's shared storage is still encrypted");
+    Ok(())
+}
+
+/// Mount a data partition that uses file encryption without metadata encryption.
+pub fn open_fbe_v1() -> Result<Opening> {
+    anyhow::ensure!(uses_fbe_v1()?, "the phone's table does not describe a plain fscrypt v1 data partition");
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let entry = &entries[0];
+    let root = Path::new(MOUNT);
+    let mounted = if mount::is_mount_point(root)? {
+        None
+    } else {
+        let device = PathBuf::from(skyward_block::fstab::device(entry)?);
+        std::fs::create_dir_all(root)?;
+        mount::mount(&device, root, &entry.filesystem, &entry.options)?;
+        Some(Opened { mapped: device, filesystem: entry.filesystem.clone(), checked: None })
+    };
+    let opened = install_fbe_v1_keys(root).and_then(|()| show_owner_storage());
+    if let Err(e) = opened {
+        if mounted.is_some() {
+            mount::umount(root).with_context(|| format!("closing the data partition also failed after {e:#}"))?;
+        }
+        return Err(e);
+    }
+    Ok(Opening { mounted, closed: Vec::new() })
 }
 
 /// Open the data partition as far as it opens with nothing a user knows:

@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(kind_of(bytes.get_ref()).unwrap(), Some(ImageKind::VendorBoot));
         assert_eq!(kind_of(&[0xd7, 0xb7, 0xab, 0x1e, 0, 0, 0, 0x40]).unwrap(), Some(ImageKind::Dtbo));
         assert_eq!(kind_of(b"AVB0\0\0\0\x01").unwrap(), Some(ImageKind::Vbmeta));
-        assert_eq!(kind_of(b"\x3a\xff\x26\xed sparse").unwrap(), None);
+        assert_eq!(kind_of(b"\x3a\xff\x26\xed sparse").unwrap(), Some(ImageKind::Sparse));
     }
 
     #[test]
@@ -546,9 +546,20 @@ mod tests {
             File::create(dir.path().join(name)).unwrap();
         }
         let both = ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery };
-        assert_eq!(partitions(both, dir.path()).unwrap(), ["recovery", "boot"]);
-        assert_eq!(partitions(ImageKind::Vbmeta, dir.path()).unwrap(), ["vbmeta"]);
-        assert!(partitions(ImageKind::Dtbo, dir.path()).unwrap().is_empty());
+        assert_eq!(partitions(both, dir.path(), Slot::A).unwrap(), ["recovery", "boot"]);
+        assert_eq!(partitions(ImageKind::Vbmeta, dir.path(), Slot::A).unwrap(), ["vbmeta"]);
+        assert!(partitions(ImageKind::Dtbo, dir.path(), Slot::A).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_single_slot_offers_unsuffixed_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["boot", "recovery", "dtbo_a"] {
+            File::create(dir.path().join(name)).unwrap();
+        }
+        let recovery = ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery };
+        assert_eq!(partitions(recovery, dir.path(), Slot::Only).unwrap(), ["recovery", "boot"]);
+        assert!(partitions(ImageKind::Dtbo, dir.path(), Slot::Only).unwrap().is_empty());
     }
 
     /// A partition of `size` bytes filled with 0xAA, so untouched bytes

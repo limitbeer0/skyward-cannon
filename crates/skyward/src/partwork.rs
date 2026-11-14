@@ -284,9 +284,9 @@ fn copy_with_libraries(program: &Path) -> Result<PathBuf> {
 
 /// Check the whole of the filesystem a partition holds, found as it is
 /// reached, and fix what is wrong, telling what the program said. The data
-/// partition is closed first and reached through a mapping of its own,
-/// which goes again once the work is done; another partition is unmounted
-/// for it and mounted again read-only after.
+/// partition is closed first and gets a temporary mapping if it has
+/// metadata encryption. Other partitions are unmounted for the repair
+/// and mounted again read-only afterwards.
 fn repair(part: Part, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
     tell(Event::Listed(vec![name(&part)]));
     tell(Event::At(0));
@@ -331,10 +331,7 @@ fn reach<T>(part: &Part, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     match part {
         Part::Data => {
             crate::wipe::release_data()?;
-            let mapped = crate::decrypt::with_key_service(data::map_unmounted).map_err(anyhow::Error::msg)?;
-            let done = work(&mapped);
-            data::unmap()?;
-            done
+            data::with_unmounted(work)
         }
         Part::Entry(entry) => {
             let at = Path::new(&entry.mount_point);

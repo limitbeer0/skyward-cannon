@@ -43,7 +43,7 @@ impl Decryptor {
             .name("decrypt".into())
             .spawn(move || {
                 let ended_as = match job {
-                    Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                    Job::Open => Ended::Opened(open()),
                     Job::Unlock { closed, user, credential } => {
                         Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
                     }
@@ -75,6 +75,14 @@ impl Drop for Decryptor {
         if let Some(thread) = self.thread.take() {
             thread.join().expect("the decrypting thread does not panic");
         }
+    }
+}
+
+pub fn open() -> Result<Opening, String> {
+    if data::uses_fbe_v1().map_err(|e| format!("{e:#}"))? {
+        data::open_fbe_v1().map_err(|e| format!("{e:#}"))
+    } else {
+        with_key_service(data::open_without_credential)
     }
 }
 
